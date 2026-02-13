@@ -106,6 +106,17 @@ func webJSON(w http.ResponseWriter, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+func adminRequest(method, path string) (*http.Response, error) {
+	req, err := http.NewRequest(method, fmt.Sprintf("http://%s%s", addr, path), nil)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	return client.Do(req)
+}
+
 func webErr(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -266,7 +277,7 @@ func webHandleProxyStatus(w http.ResponseWriter, r *http.Request) {
 		result["process_running"] = true
 		result["pid"] = pid
 	}
-	resp, err := client.Get(fmt.Sprintf("http://%s/status", addr))
+	resp, err := adminRequest("GET", "/status")
 	if err == nil {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
@@ -310,7 +321,7 @@ func webHandleProxyReload(w http.ResponseWriter, r *http.Request) {
 
 func webHandleProxyPing(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf("http://%s/ping", addr))
+	resp, err := adminRequest("GET", "/ping")
 	elapsed := time.Since(start)
 	if err != nil {
 		webJSON(w, map[string]interface{}{"alive": false, "error": connErr(err)})

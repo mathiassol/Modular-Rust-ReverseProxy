@@ -33,6 +33,7 @@ const (
 
 var (
 	addr   = "127.0.0.1:9090"
+	apiKey = ""
 	client = &http.Client{Timeout: 5 * time.Second}
 )
 
@@ -55,11 +56,35 @@ func parseFlags() []string {
 		if a[i] == "--addr" && i+1 < len(a) {
 			addr = a[i+1]
 			i++
+		} else if a[i] == "--key" && i+1 < len(a) {
+			apiKey = a[i+1]
+			i++
 		} else {
 			rest = append(rest, a[i])
 		}
 	}
+	if apiKey == "" {
+		loadAPIKeyFromConfig()
+	}
 	return rest
+}
+
+func loadAPIKeyFromConfig() {
+	cfg, err := loadConfigTOML()
+	if err != nil {
+		return
+	}
+	mods := getModules(cfg)
+	if mods == nil {
+		return
+	}
+	admin, ok := mods["admin_api"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	if key, ok := admin["api_key"].(string); ok && key != "" {
+		apiKey = key
+	}
 }
 
 func repl() {
@@ -135,7 +160,11 @@ func runCmd(input string) {
 }
 
 func apiGet(path string) {
-	resp, err := client.Get(fmt.Sprintf("http://%s%s", addr, path))
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s%s", addr, path), nil)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("  %s✗ %s%s\n", red, connErr(err), reset)
 		return
@@ -146,9 +175,12 @@ func apiGet(path string) {
 }
 
 func apiPost(path string) {
-	resp, err := client.Post(fmt.Sprintf("http://%s%s", addr, path), "", nil)
+	req, _ := http.NewRequest("POST", fmt.Sprintf("http://%s%s", addr, path), nil)
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		// stop/reload kill the server so the connection may close before we read
 		if path == "/stop" || path == "/reload" {
 			action := strings.TrimPrefix(path, "/")
 			fmt.Printf("  %s✓%s %s signal sent\n", green, reset, action)
@@ -319,7 +351,7 @@ func doStatus() {
 	pid, pidErr := readPID(pidFile)
 	running := pidErr == nil && isProcessRunning(pid)
 
-	resp, apiErr := client.Get(fmt.Sprintf("http://%s/status", addr))
+	resp, apiErr := adminRequest("GET", "/status")
 
 	if running {
 		fmt.Printf("  %s✓ Process running%s (pid %d)\n", green, reset, pid)
@@ -344,7 +376,7 @@ func doStop() {
 	root := projectRoot()
 	pidFile := filepath.Join(root, ".proxycache.pid")
 
-	resp, err := client.Post(fmt.Sprintf("http://%s/stop", addr), "", nil)
+	resp, err := adminRequest("POST", "/stop")
 	if err == nil {
 		resp.Body.Close()
 		fmt.Printf("  %s✓ Stop signal sent%s\n", green, reset)

@@ -30,17 +30,20 @@ impl ConnPool {
                     if pooled.created.elapsed() > MAX_IDLE_AGE {
                         continue;
                     }
-                    if let Ok(s) = pooled.stream.try_clone() {
-                        let _ = s.set_nonblocking(true);
-                        let mut probe = [0u8; 1];
-                        match std::io::Read::read(&mut &s, &mut probe) {
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                let _ = pooled.stream.set_nonblocking(false);
-                                crate::metrics::inc_pool_hits();
-                                return Ok(pooled.stream);
+                    let stream = pooled.stream;
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    let mut probe = [0u8; 1];
+                    match std::io::Read::read(&mut &stream, &mut probe) {
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stream.set_nonblocking(false).is_err() {
+                                continue;
                             }
-                            _ => continue,
+                            crate::metrics::inc_pool_hits();
+                            return Ok(stream);
                         }
+                        _ => continue,
                     }
                 }
             }

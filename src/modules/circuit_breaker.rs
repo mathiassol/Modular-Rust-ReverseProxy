@@ -47,10 +47,17 @@ impl Module for CircuitBreaker {
         let state = self.state.load(Ordering::Acquire);
         match state {
             STATE_OPEN => {
-                let elapsed = self.opened_at.lock().ok().map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+                let elapsed = match self.opened_at.lock() {
+                    Ok(t) => t.elapsed(),
+                    Err(poisoned) => poisoned.into_inner().elapsed(),
+                };
                 if elapsed >= Duration::from_secs(self.recovery_secs) {
-                    self.state.store(STATE_HALF_OPEN, Ordering::Release);
-                    crate::log::info("circuit_breaker: half-open, probing backend");
+                    if self.state.compare_exchange(
+                        STATE_OPEN, STATE_HALF_OPEN,
+                        Ordering::AcqRel, Ordering::Acquire,
+                    ).is_ok() {
+                        crate::log::info("circuit_breaker: half-open, probing backend");
+                    }
                     None
                 } else {
                     crate::metrics::inc_cb_rejects();
@@ -66,13 +73,30 @@ impl Module for CircuitBreaker {
         let state = self.state.load(Ordering::Acquire);
         if resp.status_code >= 500 {
             let count = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
-            if state == STATE_HALF_OPEN || count >= self.threshold {
-                self.state.store(STATE_OPEN, Ordering::Release);
-                if let Ok(mut t) = self.opened_at.lock() {
-                    *t = Instant::now();
+            if state == STATE_HALF_OPEN {
+                if self.state.compare_exchange(
+                    STATE_HALF_OPEN, STATE_OPEN,
+                    Ordering::AcqRel, Ordering::Acquire,
+                ).is_ok() {
+                    match self.opened_at.lock() {
+                        Ok(mut t) => *t = Instant::now(),
+                        Err(poisoned) => *poisoned.into_inner() = Instant::now(),
+                    }
+                    crate::metrics::inc_cb_trips();
+                    crate::log::warn("circuit_breaker: OPEN (half-open probe failed)");
                 }
-                crate::metrics::inc_cb_trips();
-                crate::log::warn(&format!("circuit_breaker: OPEN after {count} failures"));
+            } else if count >= self.threshold {
+                if self.state.compare_exchange(
+                    STATE_CLOSED, STATE_OPEN,
+                    Ordering::AcqRel, Ordering::Acquire,
+                ).is_ok() {
+                    match self.opened_at.lock() {
+                        Ok(mut t) => *t = Instant::now(),
+                        Err(poisoned) => *poisoned.into_inner() = Instant::now(),
+                    }
+                    crate::metrics::inc_cb_trips();
+                    crate::log::warn(&format!("circuit_breaker: OPEN after {count} failures"));
+                }
             }
         } else {
             if state != STATE_CLOSED {

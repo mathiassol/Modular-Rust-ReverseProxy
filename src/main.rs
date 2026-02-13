@@ -13,6 +13,7 @@ fn main() {
     let defaults = modules::collect_defaults();
     let c = config::load_config(&defaults);
     log::init(c.server.logging);
+    log::set_level(&c.server.log_level);
     log::separator();
     log::info("Loading modules...");
     let mut p = modules::Pipeline::new(c.server.client_timeout);

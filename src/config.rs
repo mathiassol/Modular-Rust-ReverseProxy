@@ -23,7 +23,11 @@ pub struct Srv {
     pub max_body_size: usize,
     pub max_connections: usize,
     pub worker_threads: usize,
+    pub shutdown_timeout: u64,
+    pub log_level: String,
     pub logging: bool,
+    pub tls_cert: String,
+    pub tls_key: String,
 }
 
 impl Default for Config {
@@ -43,14 +47,30 @@ impl Default for Srv {
             max_header_size: 65_536,
             max_body_size: 16 * 1024 * 1024,
             max_connections: 10_000,
-            worker_threads: 0, // 0 = auto (num_cpus * 2)
+            worker_threads: 0,
+            shutdown_timeout: 15,
+            log_level: "info".to_string(),
             logging: true,
+            tls_cert: String::new(),
+            tls_key: String::new(),
         }
     }
 }
 
 impl Srv {
-    pub fn validate(&mut self) {
+    /// Validate configuration and warn/fix invalid values. Returns false if config is fatally invalid.
+    pub fn validate(&mut self) -> bool {
+        let mut valid = true;
+
+        if self.listen_addr.parse::<std::net::SocketAddr>().is_err() {
+            crate::log::error(&format!("listen_addr '{}' is not a valid address (expected ip:port)", self.listen_addr));
+            valid = false;
+        }
+        if self.backend_addr.parse::<std::net::SocketAddr>().is_err() {
+            crate::log::error(&format!("backend_addr '{}' is not a valid address (expected ip:port)", self.backend_addr));
+            valid = false;
+        }
+
         if self.buffer_size < 1024 {
             crate::log::warn(&format!("buffer_size too small ({}), using 1024", self.buffer_size));
             self.buffer_size = 1024;
@@ -63,6 +83,12 @@ impl Srv {
             crate::log::warn("backend_timeout is 0, using 30");
             self.backend_timeout = 30;
         }
+        if self.client_timeout < self.backend_timeout {
+            crate::log::warn(&format!(
+                "client_timeout ({}) < backend_timeout ({}), clients may time out before backend responds",
+                self.client_timeout, self.backend_timeout
+            ));
+        }
         if self.max_body_size == 0 {
             self.max_body_size = 16 * 1024 * 1024;
         }
@@ -72,6 +98,33 @@ impl Srv {
         if self.max_connections == 0 {
             self.max_connections = 10_000;
         }
+        if self.shutdown_timeout == 0 {
+            self.shutdown_timeout = 15;
+        }
+        if self.max_connections > 100_000 {
+            crate::log::warn(&format!("max_connections very high ({}), may exhaust file descriptors", self.max_connections));
+        }
+
+        if !self.tls_cert.is_empty() || !self.tls_key.is_empty() {
+            if self.tls_cert.is_empty() {
+                crate::log::error("tls_key is set but tls_cert is missing");
+                valid = false;
+            }
+            if self.tls_key.is_empty() {
+                crate::log::error("tls_cert is set but tls_key is missing");
+                valid = false;
+            }
+            if !self.tls_cert.is_empty() && !std::path::Path::new(&self.tls_cert).exists() {
+                crate::log::error(&format!("tls_cert file not found: {}", self.tls_cert));
+                valid = false;
+            }
+            if !self.tls_key.is_empty() && !std::path::Path::new(&self.tls_key).exists() {
+                crate::log::error(&format!("tls_key file not found: {}", self.tls_key));
+                valid = false;
+            }
+        }
+
+        valid
     }
 }
 
@@ -101,7 +154,15 @@ pub fn load_config(module_defaults: &HashMap<String, toml::Value>) -> Config {
             cfg
         }
     };
-    cfg.server.validate();
+    if !cfg.server.validate() {
+        crate::log::error("Fatal configuration errors, using defaults for invalid addresses");
+        if cfg.server.listen_addr.parse::<std::net::SocketAddr>().is_err() {
+            cfg.server.listen_addr = "127.0.0.1:3000".to_string();
+        }
+        if cfg.server.backend_addr.parse::<std::net::SocketAddr>().is_err() {
+            cfg.server.backend_addr = "127.0.0.1:8080".to_string();
+        }
+    }
     let mut changed = false;
     for (name, value) in module_defaults {
         cfg.modules.entry(name.clone()).or_insert_with(|| {
@@ -129,14 +190,24 @@ fn generate_config(cfg: &Config) -> String {
     srv.insert("max_body_size".into(), toml::Value::Integer(cfg.server.max_body_size as i64));
     srv.insert("max_connections".into(), toml::Value::Integer(cfg.server.max_connections as i64));
     srv.insert("worker_threads".into(), toml::Value::Integer(cfg.server.worker_threads as i64));
+    srv.insert("shutdown_timeout".into(), toml::Value::Integer(cfg.server.shutdown_timeout as i64));
+    srv.insert("log_level".into(), toml::Value::String(cfg.server.log_level.clone()));
     srv.insert("logging".into(), toml::Value::Boolean(cfg.server.logging));
+    srv.insert("tls_cert".into(), toml::Value::String(cfg.server.tls_cert.clone()));
+    srv.insert("tls_key".into(), toml::Value::String(cfg.server.tls_key.clone()));
     doc.insert("server".into(), toml::Value::Table(srv));
     let mut mods = toml::Table::new();
     for (name, value) in &cfg.modules {
         mods.insert(name.clone(), value.clone());
     }
     doc.insert("modules".into(), toml::Value::Table(mods));
-    toml::to_string_pretty(&doc).unwrap_or_default()
+    match toml::to_string_pretty(&doc) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::log::error(&format!("Config serialization failed: {e}"));
+            String::new()
+        }
+    }
 }
 
 fn path() -> String {

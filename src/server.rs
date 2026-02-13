@@ -1,5 +1,5 @@
-// TCP server with connection handling and graceful shutdown
-use std::io::Write;
+// TCP/TLS server with connection handling and graceful shutdown
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -14,6 +14,81 @@ use crate::modules::Pipeline;
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
 
+pub enum ClientStream {
+    Plain(TcpStream),
+    Tls(rustls::StreamOwned<rustls::ServerConnection, TcpStream>),
+}
+
+impl ClientStream {
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        match self {
+            ClientStream::Plain(s) => s.peer_addr(),
+            ClientStream::Tls(s) => s.sock.peer_addr(),
+        }
+    }
+
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(s) => s.set_read_timeout(dur),
+            ClientStream::Tls(s) => s.sock.set_read_timeout(dur),
+        }
+    }
+
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(s) => s.set_write_timeout(dur),
+            ClientStream::Tls(s) => s.sock.set_write_timeout(dur),
+        }
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(s) => s.set_nodelay(nodelay),
+            ClientStream::Tls(s) => s.sock.set_nodelay(nodelay),
+        }
+    }
+
+    pub fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(s) => s.shutdown(how),
+            ClientStream::Tls(s) => s.sock.shutdown(how),
+        }
+    }
+
+    /// Extract the inner TcpStream (for raw handler). Returns None for TLS streams.
+    pub fn into_tcp_stream(self) -> Option<TcpStream> {
+        match self {
+            ClientStream::Plain(s) => Some(s),
+            ClientStream::Tls(_) => None,
+        }
+    }
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ClientStream::Plain(s) => s.read(buf),
+            ClientStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            ClientStream::Plain(s) => s.write(buf),
+            ClientStream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ClientStream::Plain(s) => s.flush(),
+            ClientStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
 pub fn active_connections() -> usize {
     ACTIVE_CONNS.load(Ordering::Acquire)
 }
@@ -23,8 +98,8 @@ pub fn request_shutdown() {
 }
 
 struct ThreadPool {
-    sender: mpsc::SyncSender<TcpStream>,
-    _workers: Vec<thread::JoinHandle<()>>,
+    sender: Option<mpsc::SyncSender<ClientStream>>,
+    workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl ThreadPool {
@@ -34,7 +109,7 @@ impl ThreadPool {
         buf_size: usize,
         write_timeout: u64,
     ) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<TcpStream>(size * 2);
+        let (tx, rx) = mpsc::sync_channel::<ClientStream>(size * 2);
         let rx = Arc::new(Mutex::new(rx));
         let mut workers = Vec::with_capacity(size);
 
@@ -66,13 +141,24 @@ impl ThreadPool {
             }));
         }
 
-        ThreadPool { sender: tx, _workers: workers }
+        ThreadPool { sender: Some(tx), workers }
     }
 
-    fn dispatch(&self, stream: TcpStream) -> Result<(), TcpStream> {
-        self.sender.try_send(stream).map_err(|e| match e {
-            mpsc::TrySendError::Full(s) | mpsc::TrySendError::Disconnected(s) => s,
-        })
+    fn dispatch(&self, stream: ClientStream) -> Result<(), ClientStream> {
+        match &self.sender {
+            Some(tx) => tx.try_send(stream).map_err(|e| match e {
+                mpsc::TrySendError::Full(s) | mpsc::TrySendError::Disconnected(s) => s,
+            }),
+            None => Err(stream),
+        }
+    }
+
+    /// Drop the sender to signal workers, then join all threads.
+    fn shutdown(&mut self) {
+        self.sender.take();
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
     }
 }
 
@@ -105,18 +191,22 @@ impl Server {
     pub fn run(&self) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.cfg.listen_addr)?;
 
+        let tls_config = build_tls_config(&self.cfg);
+        let tls_enabled = tls_config.is_some();
+
         let num_workers = if self.cfg.worker_threads > 0 {
             self.cfg.worker_threads
         } else {
             thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 2
         };
 
-        crate::log::info(&format!("Listening on {}", self.cfg.listen_addr));
+        let proto = if tls_enabled { "https" } else { "http" };
+        crate::log::info(&format!("Listening on {} ({})", self.cfg.listen_addr, proto));
         crate::log::info(&format!("Workers: {num_workers} | Max connections: {}", self.cfg.max_connections));
         crate::log::separator();
 
         install_shutdown_handler(&self.cfg.listen_addr);
-        let pool = ThreadPool::new(
+        let mut pool = ThreadPool::new(
             num_workers,
             Arc::clone(&self.pipe),
             self.cfg.buffer_size,
@@ -152,10 +242,21 @@ impl Server {
                 Ok((stream, _)) => {
                     let active = ACTIVE_CONNS.load(Ordering::Acquire);
                     if active >= max_conns {
-                        let _ = reject_overloaded(stream);
+                        let _ = reject_overloaded(ClientStream::Plain(stream));
                         continue;
                     }
-                    if let Err(s) = pool.dispatch(stream) {
+                    let client = if let Some(ref tls_cfg) = tls_config {
+                        match rustls::ServerConnection::new(Arc::clone(tls_cfg)) {
+                            Ok(conn) => ClientStream::Tls(rustls::StreamOwned::new(conn, stream)),
+                            Err(e) => {
+                                crate::log::error(&format!("TLS session init failed: {e}"));
+                                continue;
+                            }
+                        }
+                    } else {
+                        ClientStream::Plain(stream)
+                    };
+                    if let Err(s) = pool.dispatch(client) {
                         let _ = reject_overloaded(s);
                     }
                 }
@@ -174,35 +275,54 @@ impl Server {
         }
 
         crate::log::info("Shutting down...");
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let timeout_secs = self.cfg.shutdown_timeout;
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+        crate::log::info("Draining connections...");
+        let mut last_logged = 0usize;
         loop {
             let active = ACTIVE_CONNS.load(Ordering::Acquire);
-            if active == 0 || std::time::Instant::now() > deadline {
-                if active > 0 {
-                    crate::log::warn(&format!("Forcing shutdown with {active} active connections"));
-                }
+            if active == 0 {
+                crate::log::info("All connections drained");
                 break;
+            }
+            if std::time::Instant::now() > deadline {
+                crate::log::warn(&format!("Forcing shutdown with {active} active connections (timeout {timeout_secs}s)"));
+                break;
+            }
+            if active != last_logged {
+                crate::log::info(&format!("Waiting for {active} connection(s) to finish..."));
+                last_logged = active;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        drop(pool);
+        pool.shutdown();
         crate::log::info("Server stopped.");
         Ok(())
     }
 }
 
-fn reject_overloaded(mut s: TcpStream) {
+fn reject_overloaded(mut s: ClientStream) {
+    crate::metrics::inc_requests_err();
     let resp = HttpResponse::error(503, "Server overloaded");
     let _ = s.write_all(&resp.to_bytes());
     let _ = s.shutdown(Shutdown::Both);
 }
 
-fn handle(mut c: TcpStream, p: &Pipeline, buf_size: usize, write_timeout: u64) {
+fn handle(mut c: ClientStream, p: &Pipeline, buf_size: usize, write_timeout: u64) {
     crate::metrics::inc_connections();
 
     if let Some(rh) = p.raw_handler() {
-        rh.handle_raw(c);
-        return;
+        match c.into_tcp_stream() {
+            Some(tcp) => {
+                rh.handle_raw(tcp);
+                return;
+            }
+            None => {
+                crate::log::warn("Raw TCP handler is incompatible with TLS mode");
+                return;
+            }
+        }
     }
 
     let ip = c.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "?".into());
@@ -266,9 +386,110 @@ fn handle(mut c: TcpStream, p: &Pipeline, buf_size: usize, write_timeout: u64) {
 
     let out = resp.to_bytes();
     crate::metrics::add_bytes_out(out.len() as u64);
-    let _ = c.write_all(&out);
+    if c.write_all(&out).is_err() {
+        crate::log::warn("Failed to write response to client");
+    }
     let _ = c.shutdown(Shutdown::Write);
     crate::log::separator();
+}
+
+/// Build TLS ServerConfig from cert/key paths. Returns None if TLS is not configured.
+fn build_tls_config(cfg: &Srv) -> Option<Arc<rustls::ServerConfig>> {
+    if cfg.tls_cert.is_empty() || cfg.tls_key.is_empty() {
+        return None;
+    }
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap_or_else(|_| {});
+
+    let cert_path = &cfg.tls_cert;
+    let key_path = &cfg.tls_key;
+
+    let cert_file = match std::fs::File::open(cert_path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log::error(&format!("Failed to open TLS cert {cert_path}: {e}"));
+            return None;
+        }
+    };
+    let key_file = match std::fs::File::open(key_path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log::error(&format!("Failed to open TLS key {key_path}: {e}"));
+            return None;
+        }
+    };
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = {
+        let mut reader = std::io::BufReader::new(cert_file);
+        let mut certs = Vec::new();
+        loop {
+            match rustls_pemfile::read_one(&mut reader) {
+                Ok(Some(rustls_pemfile::Item::X509Certificate(cert))) => certs.push(cert),
+                Ok(None) => break,
+                Ok(Some(_)) => continue,
+                Err(e) => {
+                    crate::log::error(&format!("Failed to parse TLS cert: {e}"));
+                    return None;
+                }
+            }
+        }
+        certs
+    };
+
+    if certs.is_empty() {
+        crate::log::error("No certificates found in TLS cert file");
+        return None;
+    }
+
+    let private_key: rustls::pki_types::PrivateKeyDer<'static> = {
+        let mut reader = std::io::BufReader::new(key_file);
+        let mut key = None;
+        loop {
+            match rustls_pemfile::read_one(&mut reader) {
+                Ok(Some(rustls_pemfile::Item::Pkcs1Key(k))) => {
+                    key = Some(rustls::pki_types::PrivateKeyDer::Pkcs1(k));
+                    break;
+                }
+                Ok(Some(rustls_pemfile::Item::Pkcs8Key(k))) => {
+                    key = Some(rustls::pki_types::PrivateKeyDer::Pkcs8(k));
+                    break;
+                }
+                Ok(Some(rustls_pemfile::Item::Sec1Key(k))) => {
+                    key = Some(rustls::pki_types::PrivateKeyDer::Sec1(k));
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(_)) => continue,
+                Err(e) => {
+                    crate::log::error(&format!("Failed to parse TLS key: {e}"));
+                    return None;
+                }
+            }
+        }
+        match key {
+            Some(k) => k,
+            None => {
+                crate::log::error("No private key found in TLS key file");
+                return None;
+            }
+        }
+    };
+
+    let config = match rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log::error(&format!("TLS config error: {e}"));
+            return None;
+        }
+    };
+
+    crate::log::info("TLS enabled");
+    Some(Arc::new(config))
 }
 
 fn install_shutdown_handler(listen_addr: &str) {

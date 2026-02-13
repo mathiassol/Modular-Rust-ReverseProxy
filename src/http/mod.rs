@@ -38,23 +38,44 @@ pub enum ReadResult {
     Error(String),
 }
 
-/// Locate terminating zero-length chunk in chunked body data.
-fn find_zero_chunk(d: &[u8]) -> Option<usize> {
-    if d.len() < 3 { return None; }
-    for i in (0..d.len().saturating_sub(2)).rev() {
-        if d[i] == b'0' && d[i+1] == b'\r' && d[i+2] == b'\n' {
-            if i == 0 || (i >= 2 && d[i-2] == b'\r' && d[i-1] == b'\n') {
-                return Some(i);
-            }
+fn find_zero_chunk(d: &[u8]) -> bool {
+    if d.len() < 5 { return false; }
+    let mut i = 0;
+    while i < d.len() {
+        let chunk_start = i;
+        let mut size_end = i;
+        while size_end < d.len() && d[size_end] != b'\r' {
+            size_end += 1;
         }
+        if size_end + 1 >= d.len() || d[size_end + 1] != b'\n' {
+            return false;
+        }
+        let size_str = match std::str::from_utf8(&d[chunk_start..size_end]) {
+            Ok(s) => s.split(';').next().unwrap_or("").trim(),
+            Err(_) => return false,
+        };
+        let chunk_size = match usize::from_str_radix(size_str, 16) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if chunk_size == 0 {
+            let after = size_end + 2;
+            return after <= d.len() && d[after..].starts_with(b"\r\n")
+                || after == d.len();
+        }
+        i = size_end + 2 + chunk_size;
+        if i + 1 >= d.len() { return false; }
+        if d[i] != b'\r' || d[i + 1] != b'\n' { return false; }
+        i += 2;
     }
-    None
+    false
 }
 
 pub fn read_http_message(r: &mut impl Read, buf_size: usize) -> ReadResult {
     let mut d = Vec::with_capacity(buf_size);
     let mut b = vec![0u8; buf_size];
     let (mut hdr_done, mut body_start, mut content_len) = (false, 0usize, None::<usize>);
+    let mut is_chunked = false;
     let mut timed_out = false;
 
     loop {
@@ -81,7 +102,7 @@ pub fn read_http_message(r: &mut impl Read, buf_size: usize) -> ReadResult {
                                 return ReadResult::Error("body too large".into());
                             }
                         }
-                        let is_chunked = raw_hdr(hdr_text, "Transfer-Encoding")
+                        is_chunked = raw_hdr(hdr_text, "Transfer-Encoding")
                             .map(|v| v.eq_ignore_ascii_case("chunked"))
                             .unwrap_or(false);
                         if content_len.is_none() && !is_chunked {
@@ -91,24 +112,15 @@ pub fn read_http_message(r: &mut impl Read, buf_size: usize) -> ReadResult {
                 }
 
                 if hdr_done {
+                    let body_len = d.len() - body_start;
+                    if body_len > MAX_BODY_SIZE {
+                        return ReadResult::Error("body too large".into());
+                    }
                     if let Some(cl) = content_len {
-                        if d.len() - body_start >= cl { break; }
-                    } else {
-                        let body_len = d.len() - body_start;
-                        if body_len > MAX_BODY_SIZE {
-                            return ReadResult::Error("body too large".into());
-                        }
-                        if body_len >= 5 {
-                            let tail = &d[d.len().saturating_sub(5)..];
-                            if tail == b"0\r\n\r\n" { break; }
-                            if body_len >= 7 && d[d.len()-2..] == *b"\r\n" {
-                                let body = &d[body_start..];
-                                if let Some(pos) = find_zero_chunk(body) {
-                                    let after = &body[pos+3..];
-                                    if after.ends_with(b"\r\n") { break; }
-                                }
-                            }
-                        }
+                        if body_len >= cl { break; }
+                    } else if is_chunked {
+                        let body = &d[body_start..];
+                        if find_zero_chunk(body) { break; }
                     }
                 }
             }

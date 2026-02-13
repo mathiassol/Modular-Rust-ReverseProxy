@@ -24,8 +24,15 @@ fn main() {
                 if !file_name.ends_with(".rs") || file_name == "mod.rs" {
                     continue;
                 }
+                println!("cargo:rerun-if-changed={}", path.display());
                 let name = file_name.trim_end_matches(".rs").to_string();
-                let content = fs::read_to_string(&path).unwrap_or_default();
+                let content = match fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("cargo:warning=Failed to read {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
                 module_names.push(name.clone());
                 if content.contains("pub fn register") {
                     registerable.push(name.clone());
@@ -39,8 +46,17 @@ fn main() {
             if path.is_dir() {
                 let mod_rs = path.join("mod.rs");
                 if !mod_rs.exists() { continue; }
-                let name = path.file_name().unwrap().to_str().unwrap().to_string();
-                let content = fs::read_to_string(&mod_rs).unwrap_or_default();
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                let content = match fs::read_to_string(&mod_rs) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("cargo:warning=Failed to read {}: {}", mod_rs.display(), e);
+                        continue;
+                    }
+                };
                 module_names.push(name.clone());
                 if content.contains("pub fn register") {
                     registerable.push(name.clone());
@@ -56,7 +72,20 @@ fn main() {
     registerable.sort();
     has_defaults.sort();
 
-    let mut c = String::from("// Auto-generated module registry\n");
+    if module_names.is_empty() {
+        println!("cargo:warning=No modules found in src/modules/");
+    }
+    if registerable.is_empty() {
+        println!("cargo:warning=No registerable modules found (missing pub fn register)");
+    }
+
+    println!("cargo:warning=Discovered {} modules, {} registerable, {} with defaults",
+        module_names.len(), registerable.len(), has_defaults.len());
+
+    let mut c = format!(
+        "// Auto-generated module registry — {} modules discovered\n",
+        module_names.len()
+    );
     for name in &module_names {
         c.push_str(&format!("mod {};\n", name));
     }
@@ -170,6 +199,8 @@ pub fn register_all(p: &mut Pipeline, mc: &HashMap<String, toml::Value>, sc: &Sr
     }
     c.push_str("    d\n}\n");
 
-    fs::write(&mod_file, c).unwrap();
+    if let Err(e) = fs::write(&mod_file, c) {
+        panic!("Failed to write module registry {}: {}", mod_file.display(), e);
+    }
 }
 

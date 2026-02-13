@@ -1,5 +1,4 @@
-// Auto-generated - DO NOT EDIT
-// Drop .rs files (or dirs with mod.rs) into src/modules/ for auto-discovery
+// Auto-generated module registry — 14 modules discovered
 mod active_health;
 mod admin_api;
 mod cache;
@@ -23,9 +22,7 @@ use std::collections::{HashMap, HashSet};
 pub trait Module: Send + Sync {
     fn name(&self) -> &str;
     fn overrides(&self) -> &'static [&'static str] { &[] }
-    /// Return Some(response) to short-circuit, None to continue.
     fn handle(&self, r: &mut HttpRequest, c: &mut Context) -> Option<HttpResponse>;
-    /// Called after response is produced, in reverse pipeline order.
     fn on_response(&self, _req: &HttpRequest, _resp: &mut HttpResponse, _ctx: &mut Context) {}
 }
 
@@ -86,7 +83,6 @@ impl Pipeline {
     pub fn timeout(&self) -> u64 { self.to }
 }
 
-/// Registration context: pipeline + config + server settings.
 pub struct ModuleContext<'a> {
     pub pipeline: &'a mut Pipeline,
     pub config: &'a HashMap<String, toml::Value>,

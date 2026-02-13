@@ -45,9 +45,9 @@ impl Module for RateLimit {
         let ip = h::client_ip(c);
         let mut bs = match self.buckets.lock() {
             Ok(guard) => guard,
-            Err(_) => {
-                crate::log::warn("rate_limiter: mutex poisoned, allowing request");
-                return None;
+            Err(poisoned) => {
+                crate::log::warn("rate_limiter: mutex recovered after panic");
+                poisoned.into_inner()
             }
         };
 

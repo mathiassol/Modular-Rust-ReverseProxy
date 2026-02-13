@@ -11,12 +11,14 @@ pub fn default_config() -> toml::Table {
     let mut t = toml::Table::new();
     t.insert("enabled".into(), toml::Value::Boolean(true));
     t.insert("listen_addr".into(), toml::Value::String("127.0.0.1:9090".into()));
+    t.insert("api_key".into(), toml::Value::String("".into()));
     t
 }
 
 pub fn register(ctx: &mut super::ModuleContext) {
     if !h::is_enabled(ctx.config, "admin_api") { return; }
     let addr = h::config_str(ctx.config, "admin_api", "listen_addr", "127.0.0.1:9090");
+    let api_key = h::config_str(ctx.config, "admin_api", "api_key", "");
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
@@ -24,12 +26,16 @@ pub fn register(ctx: &mut super::ModuleContext) {
             return;
         }
     };
+    if api_key.is_empty() {
+        crate::log::warn("admin_api: no api_key set, endpoints are unprotected");
+    }
     crate::log::module_loaded(&format!("admin_api ({addr})"));
     let info = Arc::new(Info {
         start: Instant::now(),
         listen: ctx.server.listen_addr.clone(),
         backend: ctx.server.backend_addr.clone(),
         max_conns: ctx.server.max_connections,
+        api_key,
     });
     thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -44,6 +50,18 @@ struct Info {
     listen: String,
     backend: String,
     max_conns: usize,
+    api_key: String,
+}
+
+fn extract_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    for line in raw.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
 }
 
 fn handle(mut s: TcpStream, info: &Info) {
@@ -75,6 +93,18 @@ fn handle(mut s: TcpStream, info: &Info) {
     if !path.starts_with('/') {
         respond(&mut s, 400, r#"{"error":"invalid path"}"#);
         return;
+    }
+
+    let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+    crate::log::info(&format!("admin_api: {method} {path} from {peer}"));
+
+    if !info.api_key.is_empty() && path != "/ping" {
+        let provided = extract_header(&raw, "X-API-Key").unwrap_or("");
+        if provided != info.api_key {
+            crate::log::warn(&format!("admin_api: unauthorized access from {peer}"));
+            respond(&mut s, 403, r#"{"error":"unauthorized"}"#);
+            return;
+        }
     }
 
     match (method, path) {
@@ -130,6 +160,7 @@ fn respond(s: &mut TcpStream, code: u16, body: &str) {
     let status = match code {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         _ => "Error",

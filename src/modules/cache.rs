@@ -36,14 +36,16 @@ fn start_eviction_thread(cache: Arc<Mutex<HashMap<String, Entry>>>) {
             if crate::server::SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
-            if let Ok(mut m) = cache.lock() {
-                let before = m.len();
-                let now = Instant::now();
-                m.retain(|_, e| now < e.exp);
-                let evicted = before - m.len();
-                if evicted > 0 {
-                    crate::log::info(&format!("cache: evicted {evicted} expired ({} left)", m.len()));
-                }
+            let mut m = match cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let before = m.len();
+            let now = Instant::now();
+            m.retain(|_, e| now < e.exp);
+            let evicted = before - m.len();
+            if evicted > 0 {
+                crate::log::info(&format!("cache: evicted {evicted} expired ({} left)", m.len()));
             }
         }
     });
@@ -54,9 +56,11 @@ fn warm_cache(c: Arc<Mutex<HashMap<String, Entry>>>, urls: Vec<String>) {
         std::thread::sleep(Duration::from_secs(2));
         for u in urls {
             if let Ok(resp) = fetch(&u) {
-                if let Ok(mut m) = c.lock() {
-                    m.insert(u, Entry { resp, exp: Instant::now() + Duration::from_secs(300) });
-                }
+                let mut m = match c.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                m.insert(u, Entry { resp, exp: Instant::now() + Duration::from_secs(300) });
             }
         }
     });
@@ -94,9 +98,9 @@ impl Module for Cache {
         let k = r.path.clone();
         let mut m = match self.cache.lock() {
             Ok(guard) => guard,
-            Err(_) => {
-                crate::log::warn("cache: mutex poisoned, bypassing");
-                return None;
+            Err(poisoned) => {
+                crate::log::warn("cache: mutex recovered after panic");
+                poisoned.into_inner()
             }
         };
 
@@ -130,13 +134,15 @@ impl Module for Cache {
     fn on_response(&self, _req: &HttpRequest, resp: &mut HttpResponse, _ctx: &mut Context) {
         if resp.get_header("X-Cache").is_none() && resp.status_code == 200 {
             let key = _req.path.clone();
-            if let Ok(mut m) = self.cache.lock() {
-                let entry = Entry {
-                    resp: resp.clone(),
-                    exp: Instant::now() + Duration::from_secs(self._ttl),
-                };
-                m.insert(key, entry);
-            }
+            let mut m = match self.cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let entry = Entry {
+                resp: resp.clone(),
+                exp: Instant::now() + Duration::from_secs(self._ttl),
+            };
+            m.insert(key, entry);
         }
     }
 }

@@ -7,3 +7,5 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 flate2 = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"

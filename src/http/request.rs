@@ -11,6 +11,7 @@ pub struct HttpRequest {
 }
 
 impl HttpRequest {
+    /// Parse a raw HTTP request. Returns None for malformed or suspicious input.
     pub fn parse(r: &[u8]) -> Option<Self> {
         let e = find_hdr_end(r)?;
         let t = std::str::from_utf8(&r[..e]).ok()?;
@@ -20,6 +21,23 @@ impl HttpRequest {
         let m = p.next()?.to_string();
         let path = p.next()?.to_string();
         let v = p.next()?.to_string();
+
+        if p.next().is_some() { return None; }
+
+        if !matches!(m.as_str(),
+            "GET" | "POST" | "PUT" | "DELETE" | "PATCH" |
+            "HEAD" | "OPTIONS" | "CONNECT" | "TRACE") {
+            return None;
+        }
+
+        if path.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return None;
+        }
+
+        if v != "HTTP/1.0" && v != "HTTP/1.1" {
+            return None;
+        }
+
         let mut h = Vec::new();
         for ln in l {
             if ln.is_empty() { break; }
