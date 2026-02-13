@@ -53,6 +53,13 @@ func doWeb() {
 	mux.HandleFunc("/api/proxy/ping", webHandleProxyPing)
 	mux.HandleFunc("/api/proxy/logs", webHandleProxyLogs)
 	mux.HandleFunc("/api/proxy/compile", webHandleProxyCompile)
+	mux.HandleFunc("/api/proxy/metrics", webHandleProxyMetrics)
+	mux.HandleFunc("/api/proxy/protocols", webHandleProxyProtocols)
+	mux.HandleFunc("/api/proxy/tls", webHandleProxyTLS)
+	mux.HandleFunc("/api/proxy/server", webHandleProxyServer)
+	mux.HandleFunc("/api/proxy/connections", webHandleProxyConnections)
+	mux.HandleFunc("/api/proxy/verify", webHandleProxyVerify)
+	mux.HandleFunc("/api/proxy/repair", webHandleProxyRepair)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -148,6 +155,10 @@ func webHandleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(names)
 		for _, name := range names {
+			// Skip internal modules from UI
+			if name == "proxy_core" {
+				continue
+			}
 			mod, ok := mods[name].(map[string]interface{})
 			if !ok {
 				continue
@@ -351,5 +362,146 @@ func webHandleProxyCompile(w http.ResponseWriter, r *http.Request) {
 		webJSON(w, map[string]string{"status": "success"})
 	} else {
 		webErr(w, 500, "build failed")
+	}
+}
+
+func webHandleProxyMetrics(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("GET", "/metrics")
+	if err != nil {
+		webJSON(w, map[string]interface{}{"error": connErr(err)})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"error": "parse error"})
+	}
+}
+
+func webHandleProxyProtocols(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("GET", "/protocols")
+	if err != nil {
+		// Offline fallback from config
+		cfg, cfgErr := loadConfigTOML()
+		if cfgErr != nil {
+			webJSON(w, map[string]interface{}{"error": connErr(err)})
+			return
+		}
+		srv, _ := cfg["server"].(map[string]interface{})
+		h2, _ := srv["http2"].(bool)
+		h3, _ := srv["http3"].(bool)
+		cert, _ := srv["tls_cert"].(string)
+		key, _ := srv["tls_key"].(string)
+		hasTLS := cert != "" && key != ""
+		webJSON(w, map[string]interface{}{
+			"http1":       map[string]interface{}{"enabled": true},
+			"http2":       map[string]interface{}{"enabled": h2 && hasTLS},
+			"http3":       map[string]interface{}{"enabled": h3 && hasTLS},
+			"tls_enabled": hasTLS,
+			"offline":     true,
+		})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"error": "parse error"})
+	}
+}
+
+func webHandleProxyTLS(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("GET", "/tls")
+	if err != nil {
+		webJSON(w, map[string]interface{}{"enabled": false, "offline": true})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"error": "parse error"})
+	}
+}
+
+func webHandleProxyServer(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("GET", "/server")
+	if err != nil {
+		// Offline: read from config file
+		cfg, cfgErr := loadConfigTOML()
+		if cfgErr != nil {
+			webJSON(w, map[string]interface{}{"error": cfgErr.Error()})
+			return
+		}
+		if srv, ok := cfg["server"].(map[string]interface{}); ok {
+			srv["offline"] = true
+			webJSON(w, srv)
+		} else {
+			webJSON(w, map[string]interface{}{"error": "no server section"})
+		}
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"error": "parse error"})
+	}
+}
+
+func webHandleProxyConnections(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("GET", "/connections")
+	if err != nil {
+		webJSON(w, map[string]interface{}{"active": 0, "max": 0, "offline": true})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"error": "parse error"})
+	}
+}
+
+func webHandleProxyVerify(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("GET", "/config/verify")
+	if err != nil {
+		webJSON(w, map[string]interface{}{"ok": false, "error": connErr(err)})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"ok": false, "error": "parse error"})
+	}
+}
+
+func webHandleProxyRepair(w http.ResponseWriter, r *http.Request) {
+	resp, err := adminRequest("POST", "/config/repair")
+	if err != nil {
+		webJSON(w, map[string]interface{}{"ok": false, "error": connErr(err)})
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) == nil {
+		webJSON(w, data)
+	} else {
+		webJSON(w, map[string]interface{}{"ok": false, "error": "parse error"})
 	}
 }

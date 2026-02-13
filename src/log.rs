@@ -100,6 +100,7 @@ pub fn warn(msg: &str) {
 }
 
 pub fn error(msg: &str) {
+    if !active() { return; }
     let ts = timestamp();
     let _ = writeln!(io::stderr(), "{DIM}{ts}{RESET} {RED}✗ {msg}{RESET}");
     let _ = io::stderr().flush();
@@ -128,11 +129,7 @@ pub fn response(status: u16, ms: u128, is_cache_hit: bool) {
     if !active() || !above_level(LEVEL_INFO) { return; }
     let ts = timestamp();
     let col = status_color(status);
-    let source = if is_cache_hit {
-        format!(" {CYAN}[CACHE HIT]{RESET}")
-    } else {
-        format!(" {YELLOW}[BACKEND]{RESET}")
-    };
+    let source = if is_cache_hit { format!(" {CYAN}[CACHE HIT]{RESET}") } else { String::new() };
     let _ = writeln!(io::stdout(), "{DIM}{ts}{RESET} {GREEN}←{RESET} {BOLD}{col}{status}{RESET} ({ms}ms){source}");
     let _ = io::stdout().flush();
 }

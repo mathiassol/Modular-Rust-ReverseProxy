@@ -44,6 +44,10 @@ impl Module for RoundRobin {
     fn name(&self) -> &str { "load_balancer" }
     fn handle(&self, _: &mut HttpRequest, c: &mut Context) -> Option<HttpResponse> {
         let len = self.backends.len();
+        if len == 0 {
+            crate::log::error("load_balancer: no backends configured");
+            return Some(HttpResponse::error(503, "No backends available"));
+        }
         let start = self.idx.fetch_add(1, Ordering::Relaxed) % len;
         for offset in 0..len {
             let addr = &self.backends[(start + offset) % len];
@@ -52,7 +56,7 @@ impl Module for RoundRobin {
                 return None;
             }
         }
-        c.set("_backend_addr", self.backends[start % len].clone());
+        c.set("_backend_addr", self.backends[start].clone());
         None
     }
 }

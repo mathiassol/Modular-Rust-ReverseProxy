@@ -132,6 +132,28 @@ func runCmd(input string) {
 		doRun()
 	case "ls", "modules":
 		doListModules()
+	case "mods":
+		doMods()
+	case "verify":
+		doVerify()
+	case "repair":
+		doRepair()
+	case "metrics":
+		doMetrics()
+	case "connections", "conns":
+		doConnections()
+	case "protocols", "proto":
+		doProtocols()
+	case "config":
+		if len(args) > 0 {
+			doEditSection(args[0])
+		} else {
+			doShowConfig()
+		}
+	case "tls":
+		doTLS()
+	case "server":
+		doShowServer()
 	case "toggle":
 		if len(args) < 1 {
 			fmt.Printf("  %sUsage: toggle <module|web>%s\n", yellow, reset)
@@ -155,7 +177,7 @@ func runCmd(input string) {
 	case "exit", "quit":
 		os.Exit(0)
 	default:
-		fmt.Printf("  %s✗ Unknown: %s%s\n", red, cmd, reset)
+		fmt.Printf("  %s✗ Unknown: %s%s  (type 'help' for commands)\n", red, cmd, reset)
 	}
 }
 
@@ -366,10 +388,61 @@ func doStatus() {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Printf("  %s✓ API responding%s\n", green, reset)
-		printJSON(body)
+		var data map[string]interface{}
+		if json.Unmarshal(body, &data) == nil {
+			fmt.Printf("\n  %s%sOverview%s\n", bold, cyan, reset)
+			fmt.Printf("  %s%s%s\n", dim, sep, reset)
+			printStatusField("Listen", data["listen"])
+			printStatusField("Backend", data["backend"])
+			printStatusField("Scheme", data["scheme"])
+			printStatusField("Protocols", data["protocols"])
+			printStatusField("Uptime", data["uptime"])
+			fmt.Printf("\n  %s%sTraffic%s\n", bold, cyan, reset)
+			fmt.Printf("  %s%s%s\n", dim, sep, reset)
+			printStatusField("Requests", data["requests_total"])
+			printStatusField("OK", data["requests_ok"])
+			printStatusField("Errors", data["requests_err"])
+			printStatusField("Bytes In", formatBytes(data["bytes_in"]))
+			printStatusField("Bytes Out", formatBytes(data["bytes_out"]))
+			printStatusField("Avg Latency", fmt.Sprintf("%vms", data["avg_latency_ms"]))
+			fmt.Printf("\n  %s%sResources%s\n", bold, cyan, reset)
+			fmt.Printf("  %s%s%s\n", dim, sep, reset)
+			printStatusField("Connections", fmt.Sprintf("%v / %v", data["active_connections"], data["max_connections"]))
+			printStatusField("PID", data["pid"])
+		}
 	} else {
 		fmt.Printf("  %s✗ API not responding%s\n", red, reset)
 	}
+}
+
+func printStatusField(label string, value interface{}) {
+	if value == nil {
+		value = "—"
+	}
+	fmt.Printf("  %s%-16s%s %v\n", cyan, label, reset, value)
+}
+
+func formatBytes(v interface{}) string {
+	if v == nil {
+		return "0 B"
+	}
+	var b float64
+	switch val := v.(type) {
+	case float64:
+		b = val
+	case int64:
+		b = float64(val)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+	if b < 1024 {
+		return fmt.Sprintf("%.0f B", b)
+	} else if b < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", b/1024)
+	} else if b < 1024*1024*1024 {
+		return fmt.Sprintf("%.1f MB", b/(1024*1024))
+	}
+	return fmt.Sprintf("%.2f GB", b/(1024*1024*1024))
 }
 
 func doStop() {
@@ -520,6 +593,10 @@ func doListModules() {
 	sort.Strings(names)
 
 	for _, name := range names {
+		// Skip internal modules from CLI display
+		if name == "proxy_core" {
+			continue
+		}
 		mod, ok := mods[name].(map[string]interface{})
 		if !ok {
 			continue
@@ -748,21 +825,515 @@ func binaryPath() string {
 	return filepath.Join("target", "debug", name)
 }
 
+func doMetrics() {
+	resp, err := adminRequest("GET", "/metrics")
+	if err != nil {
+		fmt.Printf("  %s✗ %s%s\n", red, connErr(err), reset)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) != nil {
+		fmt.Println(string(body))
+		return
+	}
+	fmt.Printf("  %s%sRequests%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Total", data["requests_total"])
+	printStatusField("OK", data["requests_ok"])
+	printStatusField("Errors", data["requests_err"])
+	fmt.Printf("\n  %s%sBandwidth%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Bytes In", formatBytes(data["bytes_in"]))
+	printStatusField("Bytes Out", formatBytes(data["bytes_out"]))
+	fmt.Printf("\n  %s%sLatency%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Avg (ms)", data["avg_latency_ms"])
+	printStatusField("Max (ms)", data["latency_max_ms"])
+	printStatusField("Sum (ms)", data["latency_sum_ms"])
+	fmt.Printf("\n  %s%sConnections%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Active", data["active_connections"])
+	printStatusField("Total", data["connections_total"])
+	printStatusField("Pool Hits", data["pool_hits"])
+	printStatusField("Pool Misses", data["pool_misses"])
+	fmt.Printf("\n  %s%sCircuit Breaker%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Trips", data["cb_trips"])
+	printStatusField("Rejects", data["cb_rejects"])
+	fmt.Printf("\n  %s%sSystem%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Uptime", fmt.Sprintf("%vs", data["uptime_secs"]))
+}
+
+func doConnections() {
+	resp, err := adminRequest("GET", "/connections")
+	if err != nil {
+		fmt.Printf("  %s✗ %s%s\n", red, connErr(err), reset)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) != nil {
+		fmt.Println(string(body))
+		return
+	}
+	active := data["active"]
+	max := data["max"]
+	total := data["total_connections"]
+	fmt.Printf("  %s%sConnections%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printStatusField("Active", active)
+	printStatusField("Max Allowed", max)
+	printStatusField("Total Served", total)
+}
+
+func doProtocols() {
+	resp, err := adminRequest("GET", "/protocols")
+	if err != nil {
+		// Offline: read from config
+		cfg, cfgErr := loadConfigTOML()
+		if cfgErr != nil {
+			fmt.Printf("  %s✗ %s%s\n", red, connErr(err), reset)
+			return
+		}
+		srv, _ := cfg["server"].(map[string]interface{})
+		fmt.Printf("  %s%sProtocols%s %s(from config, proxy not running)%s\n", bold, cyan, reset, dim, reset)
+		fmt.Printf("  %s%s%s\n", dim, sep, reset)
+		fmt.Printf("  %s✓ HTTP/1.1%s    always enabled\n", green, reset)
+		h2, _ := srv["http2"].(bool)
+		h3, _ := srv["http3"].(bool)
+		tlsCert, _ := srv["tls_cert"].(string)
+		tlsKey, _ := srv["tls_key"].(string)
+		hasTLS := tlsCert != "" && tlsKey != ""
+		if h2 && hasTLS {
+			fmt.Printf("  %s✓ HTTP/2%s      ALPN via TLS\n", green, reset)
+		} else if h2 {
+			fmt.Printf("  %s● HTTP/2%s      enabled (needs TLS)\n", yellow, reset)
+		} else {
+			fmt.Printf("  %s✗ HTTP/2%s      disabled\n", red, reset)
+		}
+		if h3 && hasTLS {
+			h3p, _ := srv["h3_port"].(int64)
+			fmt.Printf("  %s✓ HTTP/3%s      QUIC port %d\n", green, reset, h3p)
+		} else if h3 {
+			fmt.Printf("  %s● HTTP/3%s      enabled (needs TLS)\n", yellow, reset)
+		} else {
+			fmt.Printf("  %s✗ HTTP/3%s      disabled\n", red, reset)
+		}
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) != nil {
+		fmt.Println(string(body))
+		return
+	}
+	tls, _ := data["tls_enabled"].(bool)
+	fmt.Printf("  %s%sProtocols%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	fmt.Printf("  %s✓ HTTP/1.1%s    always enabled\n", green, reset)
+	if h2, ok := data["http2"].(map[string]interface{}); ok {
+		if en, _ := h2["enabled"].(bool); en {
+			fmt.Printf("  %s✓ HTTP/2%s      ALPN \"%s\"\n", green, reset, h2["alpn"])
+		} else {
+			reason := "disabled"
+			if !tls {
+				reason = "needs TLS"
+			}
+			fmt.Printf("  %s✗ HTTP/2%s      %s\n", red, reset, reason)
+		}
+	}
+	if h3, ok := data["http3"].(map[string]interface{}); ok {
+		if en, _ := h3["enabled"].(bool); en {
+			fmt.Printf("  %s✓ HTTP/3%s      QUIC port %v\n", green, reset, h3["port"])
+		} else {
+			reason := "disabled"
+			if !tls {
+				reason = "needs TLS"
+			}
+			fmt.Printf("  %s✗ HTTP/3%s      %s\n", red, reset, reason)
+		}
+	}
+	if tls {
+		fmt.Printf("\n  %sTLS:%s enabled\n", cyan, reset)
+	} else {
+		fmt.Printf("\n  %sTLS:%s %snot configured%s\n", cyan, reset, dim, reset)
+	}
+}
+
+func doTLS() {
+	resp, err := adminRequest("GET", "/tls")
+	if err != nil {
+		// Offline
+		cfg, cfgErr := loadConfigTOML()
+		if cfgErr != nil {
+			fmt.Printf("  %s✗ %s%s\n", red, connErr(err), reset)
+			return
+		}
+		srv, _ := cfg["server"].(map[string]interface{})
+		cert, _ := srv["tls_cert"].(string)
+		key, _ := srv["tls_key"].(string)
+		fmt.Printf("  %s%sTLS Configuration%s %s(from config)%s\n", bold, cyan, reset, dim, reset)
+		fmt.Printf("  %s%s%s\n", dim, sep, reset)
+		if cert == "" && key == "" {
+			fmt.Printf("  %s✗ TLS not configured%s\n", red, reset)
+			fmt.Printf("  %sSet tls_cert and tls_key in [server] to enable%s\n", dim, reset)
+		} else {
+			printStatusField("Cert", cert)
+			printStatusField("Key", key)
+		}
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) != nil {
+		fmt.Println(string(body))
+		return
+	}
+	fmt.Printf("  %s%sTLS Configuration%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	if en, _ := data["enabled"].(bool); en {
+		fmt.Printf("  %s✓ TLS enabled%s\n", green, reset)
+		printStatusField("Cert Path", data["cert_path"])
+		printStatusField("Key Path", data["key_path"])
+		certOk, _ := data["cert_exists"].(bool)
+		keyOk, _ := data["key_exists"].(bool)
+		if certOk {
+			fmt.Printf("  %sCert File:%s %s✓ exists%s\n", cyan, reset, green, reset)
+		} else {
+			fmt.Printf("  %sCert File:%s %s✗ missing%s\n", cyan, reset, red, reset)
+		}
+		if keyOk {
+			fmt.Printf("  %sKey File:%s  %s✓ exists%s\n", cyan, reset, green, reset)
+		} else {
+			fmt.Printf("  %sKey File:%s  %s✗ missing%s\n", cyan, reset, red, reset)
+		}
+		printStatusField("ALPN", data["alpn_protocols"])
+		printStatusField("Session Cache", data["session_cache_size"])
+	} else {
+		fmt.Printf("  %s✗ TLS not configured%s\n", red, reset)
+		fmt.Printf("  %sSet tls_cert and tls_key in [server] to enable%s\n", dim, reset)
+	}
+}
+
+func doShowConfig() {
+	// Try API first
+	resp, err := adminRequest("GET", "/server")
+	if err != nil {
+		// Offline: read from config file
+		cfg, cfgErr := loadConfigTOML()
+		if cfgErr != nil {
+			fmt.Printf("  %s✗ Can't read config: %s%s\n", red, cfgErr, reset)
+			return
+		}
+		fmt.Printf("  %s%s[server]%s %s(from config.toml)%s\n", bold, cyan, reset, dim, reset)
+		fmt.Printf("  %s%s%s\n", dim, sep, reset)
+		if srv, ok := cfg["server"].(map[string]interface{}); ok {
+			printSortedKV(srv)
+		}
+		fmt.Printf("\n  %s%s[modules]%s %s(from config.toml)%s\n", bold, cyan, reset, dim, reset)
+		fmt.Printf("  %s%s%s\n", dim, sep, reset)
+		if mods := getModules(cfg); mods != nil {
+			names := sortedKeys(mods)
+			for _, name := range names {
+				// Skip internal modules from CLI display
+				if name == "proxy_core" {
+					continue
+				}
+				mod, ok := mods[name].(map[string]interface{})
+				if !ok {
+					continue
+				}
+				enabled := false
+				if e, ok := mod["enabled"].(bool); ok {
+					enabled = e
+				}
+				icon := red + "✗" + reset
+				if enabled {
+					icon = green + "✓" + reset
+				}
+				fmt.Printf("  %s %s%-16s%s", icon, cyan, name, reset)
+				// Show key settings inline
+				keys := sortedKeys(mod)
+				parts := []string{}
+				for _, k := range keys {
+					if k == "enabled" {
+						continue
+					}
+					parts = append(parts, fmt.Sprintf("%s=%v", k, mod[k]))
+				}
+				if len(parts) > 0 {
+					fmt.Printf(" %s%s%s", dim, strings.Join(parts, ", "), reset)
+				}
+				fmt.Println()
+			}
+		}
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var data map[string]interface{}
+	if json.Unmarshal(body, &data) != nil {
+		fmt.Println(string(body))
+		return
+	}
+	fmt.Printf("  %s%s[server]%s %s(live)%s\n", bold, cyan, reset, dim, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	printSortedKV(data)
+}
+
+func doShowServer() {
+	doShowConfig()
+}
+
+func printSortedKV(m map[string]interface{}) {
+	keys := sortedKeys(m)
+	for _, k := range keys {
+		v := m[k]
+		switch val := v.(type) {
+		case float64:
+			if val == float64(int64(val)) {
+				fmt.Printf("  %s%-20s%s %d\n", cyan, k, reset, int64(val))
+			} else {
+				fmt.Printf("  %s%-20s%s %g\n", cyan, k, reset, val)
+			}
+		case bool:
+			if val {
+				fmt.Printf("  %s%-20s%s %s%v%s\n", cyan, k, reset, green, val, reset)
+			} else {
+				fmt.Printf("  %s%-20s%s %s%v%s\n", cyan, k, reset, dim, val, reset)
+			}
+		default:
+			fmt.Printf("  %s%-20s%s %v\n", cyan, k, reset, v)
+		}
+	}
+}
+
+func sortedKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func printHelp() {
-	fmt.Printf("  %s%sProxy control%s\n", bold, cyan, reset)
-	fmt.Printf("    %srun%s       Start proxy (detached, survives CLI exit)\n", cyan, reset)
-	fmt.Printf("    %sstatus%s    Check proxy process & API status\n", cyan, reset)
-	fmt.Printf("    %sstop%s      Stop the proxy\n", cyan, reset)
-	fmt.Printf("    %sreload%s    Stop → compile → start\n", cyan, reset)
-	fmt.Printf("    %slogs%s      Show last 50 log lines\n", cyan, reset)
-	fmt.Printf("    %sping%s      Quick connectivity check\n\n", cyan, reset)
-	fmt.Printf("  %s%sConfig%s\n", bold, cyan, reset)
-	fmt.Printf("    %sls%s        List server, modules & web\n", cyan, reset)
-	fmt.Printf("    %stoggle%s    Toggle module on/off       %s(toggle rate_limiter)%s\n", cyan, reset, dim, reset)
-	fmt.Printf("    %sedit%s      Edit server or module      %s(edit server, edit cache)%s\n\n", cyan, reset, dim, reset)
+	fmt.Printf("  %s%sProxy Control%s\n", bold, cyan, reset)
+	fmt.Printf("    %srun%s         Start proxy (detached)\n", cyan, reset)
+	fmt.Printf("    %sstatus%s      Full proxy status + metrics summary\n", cyan, reset)
+	fmt.Printf("    %sstop%s        Stop the proxy\n", cyan, reset)
+	fmt.Printf("    %sreload%s      Stop → compile → start\n", cyan, reset)
+	fmt.Printf("    %slogs%s        Show last 50 log lines\n", cyan, reset)
+	fmt.Printf("    %sping%s        Quick connectivity check\n\n", cyan, reset)
+	fmt.Printf("  %s%sMonitoring%s\n", bold, cyan, reset)
+	fmt.Printf("    %smetrics%s     Full metrics (requests, latency, pool, CB)\n", cyan, reset)
+	fmt.Printf("    %sconns%s       Active/max/total connections\n", cyan, reset)
+	fmt.Printf("    %sprotocols%s   HTTP/1.1, HTTP/2, HTTP/3 status\n", cyan, reset)
+	fmt.Printf("    %stls%s         TLS configuration and cert status\n\n", cyan, reset)
+	fmt.Printf("  %s%sConfiguration%s\n", bold, cyan, reset)
+	fmt.Printf("    %sconfig%s      Show full server + module config\n", cyan, reset)
+	fmt.Printf("    %sls%s          List modules with on/off status\n", cyan, reset)
+	fmt.Printf("    %stoggle%s      Toggle module on/off       %s(toggle rate_limiter)%s\n", cyan, reset, dim, reset)
+	fmt.Printf("    %sedit%s        Edit server or module      %s(edit server, edit cache)%s\n", cyan, reset, dim, reset)
+	fmt.Printf("    %sverify%s      Verify config.toml integrity\n", cyan, reset)
+	fmt.Printf("    %srepair%s      Auto-repair config with missing defaults\n\n", cyan, reset)
+	fmt.Printf("  %s%sModules%s\n", bold, cyan, reset)
+	fmt.Printf("    %smods%s        List script (.pcmod) + Rust + imported modules\n\n", cyan, reset)
 	fmt.Printf("  %s%sDevelopment%s\n", bold, cyan, reset)
-	fmt.Printf("    %scompile%s   Build Rust + CLI & restart CLI\n", cyan, reset)
-	fmt.Printf("    %sweb%s       Launch web dashboard\n", cyan, reset)
-	fmt.Printf("    %sclear%s     Clear screen\n", cyan, reset)
-	fmt.Printf("    %sexit%s      Exit CLI (proxy keeps running)\n", cyan, reset)
+	fmt.Printf("    %scompile%s     Build Rust + CLI & restart CLI\n", cyan, reset)
+	fmt.Printf("    %sweb%s         Launch web dashboard\n", cyan, reset)
+	fmt.Printf("    %sclear%s       Clear screen\n", cyan, reset)
+	fmt.Printf("    %sexit%s        Exit CLI (proxy keeps running)\n", cyan, reset)
+}
+
+func doMods() {
+	root := projectRoot()
+
+	// List .pcmod files from mods/ directory
+	modsDir := filepath.Join(root, "mods")
+	entries, err := os.ReadDir(modsDir)
+
+	fmt.Printf("  %s%sScript Modules (.pcmod)%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%-20s %-10s %s%s\n", dim, "NAME", "VERSION", "FILE", reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+
+	if err != nil {
+		fmt.Printf("  %sNo mods/ directory found%s\n", dim, reset)
+	} else {
+		found := false
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".pcmod") {
+				continue
+			}
+			found = true
+			data, err := os.ReadFile(filepath.Join(modsDir, e.Name()))
+			if err != nil {
+				fmt.Printf("  %-20s %s(error reading)%s\n", e.Name(), red, reset)
+				continue
+			}
+			name, version := parsePcmod(string(data))
+			fmt.Printf("  %-20s %-10s %s%s%s\n", name, version, dim, e.Name(), reset)
+		}
+		if !found {
+			fmt.Printf("  %sNo .pcmod files found (check mods/examples/ for templates)%s\n", dim, reset)
+		}
+	}
+
+	// List example .pcmod files
+	exDir := filepath.Join(modsDir, "examples")
+	exEntries, exErr := os.ReadDir(exDir)
+	if exErr == nil && len(exEntries) > 0 {
+		fmt.Printf("\n  %s%sExample Templates (mods/examples/)%s\n", bold, cyan, reset)
+		fmt.Printf("  %s%s%s\n", dim, sep, reset)
+		for _, e := range exEntries {
+			if !strings.HasSuffix(e.Name(), ".pcmod") {
+				continue
+			}
+			data, _ := os.ReadFile(filepath.Join(exDir, e.Name()))
+			name, version := parsePcmod(string(data))
+			fmt.Printf("  %-20s %-10s %s%s%s\n", name, version, dim, e.Name(), reset)
+		}
+		fmt.Printf("\n  %sCopy examples to mods/ to activate: copy mods\\examples\\*.pcmod mods\\%s\n", dim, reset)
+	}
+
+	// List Rust modules
+	fmt.Printf("\n  %s%sRust Modules (compiled)%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s%s\n", dim, sep, reset)
+	srcDir := filepath.Join(root, "src", "modules")
+	srcEntries, _ := os.ReadDir(srcDir)
+	for _, e := range srcEntries {
+		n := e.Name()
+		if e.IsDir() || n == "mod.rs" || n == "helpers.rs" || !strings.HasSuffix(n, ".rs") {
+			continue
+		}
+		name := strings.TrimSuffix(n, ".rs")
+		fmt.Printf("  %-20s %s(built-in)%s\n", name, dim, reset)
+	}
+
+	// List imports
+	impDir := filepath.Join(root, "imports")
+	impEntries, impErr := os.ReadDir(impDir)
+	if impErr == nil {
+		hasImports := false
+		for _, e := range impEntries {
+			if strings.HasSuffix(e.Name(), ".rs") {
+				if !hasImports {
+					fmt.Printf("\n  %s%sImported Modules (imports/)%s\n", bold, cyan, reset)
+					fmt.Printf("  %s%s%s\n", dim, sep, reset)
+					hasImports = true
+				}
+				name := strings.TrimSuffix(e.Name(), ".rs")
+				fmt.Printf("  %-20s %s(needs compile)%s\n", name, yellow, reset)
+			}
+		}
+	}
+}
+
+func parsePcmod(content string) (name, version string) {
+	name = "unknown"
+	version = "?"
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "mod ") {
+			name = strings.TrimSpace(strings.TrimPrefix(line, "mod "))
+			name = strings.Trim(name, "\"")
+		}
+		if strings.HasPrefix(line, "version ") {
+			version = strings.TrimSpace(strings.TrimPrefix(line, "version "))
+			version = strings.Trim(version, "\"")
+		}
+	}
+	return
+}
+
+func doVerify() {
+	// Try API first (if proxy is running)
+	resp, err := adminRequest("GET", "/config/verify")
+	if err == nil {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		var result map[string]interface{}
+		if json.Unmarshal(body, &result) == nil {
+			ok, _ := result["ok"].(bool)
+			if ok {
+				fmt.Printf("  %s✓ Config is valid%s\n", green, reset)
+			} else {
+				fmt.Printf("  %s✗ Config issues found:%s\n", red, reset)
+				if issues, ok := result["issues"].([]interface{}); ok {
+					for _, issue := range issues {
+						fmt.Printf("    %s• %v%s\n", yellow, issue, reset)
+					}
+				}
+				if errMsg, ok := result["error"].(string); ok {
+					fmt.Printf("    %s• %s%s\n", red, errMsg, reset)
+				}
+			}
+			return
+		}
+	}
+
+	// Offline verify: just check config.toml parse
+	root := projectRoot()
+	cfgPath := filepath.Join(root, "config.toml")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		fmt.Printf("  %s✗ Cannot read config.toml: %s%s\n", red, err, reset)
+		return
+	}
+	var cfg map[string]interface{}
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		fmt.Printf("  %s✗ Parse error: %s%s\n", red, err, reset)
+		return
+	}
+
+	issues := []string{}
+	if _, ok := cfg["server"]; !ok {
+		issues = append(issues, "missing [server] section")
+	}
+	if _, ok := cfg["modules"]; !ok {
+		issues = append(issues, "missing [modules] section")
+	}
+
+	if len(issues) == 0 {
+		fmt.Printf("  %s✓ Config is valid%s\n", green, reset)
+	} else {
+		fmt.Printf("  %s✗ Config issues found:%s\n", red, reset)
+		for _, issue := range issues {
+			fmt.Printf("    %s• %s%s\n", yellow, issue, reset)
+		}
+	}
+}
+
+func doRepair() {
+	resp, err := adminRequest("POST", "/config/repair")
+	if err != nil {
+		fmt.Printf("  %s✗ Proxy not running. Repair requires running proxy (for module discovery).%s\n", red, reset)
+		fmt.Printf("  %sTip: start the proxy with 'run', then try 'repair' again%s\n", dim, reset)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	if json.Unmarshal(body, &result) == nil {
+		ok, _ := result["ok"].(bool)
+		if ok {
+			if fixes, ok := result["fixes"].([]interface{}); ok && len(fixes) > 0 {
+				fmt.Printf("  %s✓ Config repaired:%s\n", green, reset)
+				for _, fix := range fixes {
+					fmt.Printf("    %s• %v%s\n", cyan, fix, reset)
+				}
+			} else {
+				fmt.Printf("  %s✓ Config already valid, no repairs needed%s\n", green, reset)
+			}
+		} else {
+			fmt.Printf("  %s✗ Repair failed%s\n", red, reset)
+			printJSON(body)
+		}
+	}
 }

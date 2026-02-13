@@ -2,16 +2,8 @@
 use super::{helpers as h, Module};
 use crate::context::Context;
 use crate::http::{HttpRequest, HttpResponse};
-use crate::pool::ConnPool;
 use std::io::Write;
-use std::sync::Arc;
 use std::time::Duration;
-
-static POOL: std::sync::OnceLock<Arc<ConnPool>> = std::sync::OnceLock::new();
-
-fn get_pool() -> &'static Arc<ConnPool> {
-    POOL.get_or_init(|| Arc::new(ConnPool::new()))
-}
 
 pub fn default_config() -> toml::Table {
     let mut t = toml::Table::new();
@@ -38,33 +30,44 @@ impl Module for ProxyCore {
             Err(_) => return Some(HttpResponse::error(502, "Invalid backend address")),
         };
         let timeout = Duration::from_secs(self.to);
-        let pool = get_pool();
+        let pool = crate::pool::global_pool();
         let mut s = match pool.get(&sock_addr, timeout) {
             Ok(s) => s,
             Err(_) => return Some(HttpResponse::error(502, "Backend unavailable")),
         };
         let _ = s.set_read_timeout(Some(timeout));
         let _ = s.set_write_timeout(Some(timeout));
-        if s.write_all(&r.to_bytes()).is_err() {
+        if let Err(e) = s.write_all(&r.to_bytes()) {
+            crate::log::warn(&format!("proxy_core: backend write error: {e}"));
             return Some(HttpResponse::error(502, "Backend write failed"));
         }
         let raw = crate::http::read_http_message(&mut s, self.buf);
         let resp = match raw {
             crate::http::ReadResult::Ok(d) => {
-                let reuse = !d.is_empty();
-                let parsed = HttpResponse::parse(&d).unwrap_or_else(|| HttpResponse::error(502, "Parse failed"));
-                if reuse {
-                    let conn_hdr = parsed.get_header("Connection").unwrap_or("");
-                    if !conn_hdr.eq_ignore_ascii_case("close") {
-                        if let Ok(cloned) = s.try_clone() {
-                            pool.put(sock_addr, cloned);
+                match HttpResponse::parse(&d) {
+                    Some(parsed) => {
+                        let conn_hdr = parsed.get_header("Connection").unwrap_or("");
+                        let keep_alive = if parsed.version == "HTTP/1.0" {
+                            conn_hdr.eq_ignore_ascii_case("keep-alive")
+                        } else {
+                            !conn_hdr.eq_ignore_ascii_case("close")
+                        };
+                        if keep_alive {
+                            pool.put(sock_addr, s);
                         }
+                        parsed
+                    }
+                    None => {
+                        crate::log::warn("proxy_core: failed to parse backend response");
+                        HttpResponse::error(502, "Parse failed")
                     }
                 }
-                parsed
             }
             crate::http::ReadResult::TimedOut => HttpResponse::error(504, "Backend timeout"),
-            crate::http::ReadResult::Error(_) => HttpResponse::error(502, "Backend error"),
+            crate::http::ReadResult::Error(e) => {
+                crate::log::warn(&format!("proxy_core: backend error: {e}"));
+                HttpResponse::error(502, "Backend error")
+            }
         };
         Some(resp)
     }

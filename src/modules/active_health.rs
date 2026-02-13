@@ -1,7 +1,7 @@
 // Active health checking for backends
 use super::helpers as h;
 use std::collections::HashMap;
-use std::net::TcpStream;
+use std::net::{TcpStream, SocketAddr};
 use std::sync::{Arc, RwLock, OnceLock};
 use std::time::Duration;
 
@@ -32,27 +32,56 @@ pub fn register(ctx: &mut super::ModuleContext) {
         backends.push(ctx.server.backend_addr.clone());
     }
 
-    let map: HashMap<String, bool> = backends.iter().map(|b| (b.clone(), true)).collect();
+    let mut valid_backends = Vec::new();
+    for b in &backends {
+        match b.parse::<SocketAddr>() {
+            Ok(_) => valid_backends.push(b.clone()),
+            Err(_) => crate::log::warn(&format!("active_health: invalid backend address '{}', skipping", b)),
+        }
+    }
+    if valid_backends.is_empty() {
+        crate::log::warn("active_health: no valid backends to monitor");
+        return;
+    }
+
+    let map: HashMap<String, bool> = valid_backends.iter().map(|b| (b.clone(), true)).collect();
     let health = HEALTH.get_or_init(|| Arc::new(RwLock::new(map)));
     let health = Arc::clone(health);
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(interval));
+            if crate::server::SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let addrs: Vec<String> = match health.read() {
+                Ok(m) => m.keys().cloned().collect(),
+                Err(_) => continue,
+            };
+            let results: Vec<(String, bool)> = addrs.into_iter().map(|addr| {
+                let ok = addr.parse::<SocketAddr>().ok().map(|sa| {
+                    TcpStream::connect_timeout(&sa, Duration::from_secs(timeout)).is_ok()
+                }).unwrap_or(false);
+                (addr, ok)
+            }).collect();
             if let Ok(mut m) = health.write() {
-                for (addr, up) in m.iter_mut() {
-                    let ok = TcpStream::connect_timeout(
-                        &addr.parse().unwrap_or_else(|_| ([127,0,0,1], 80).into()),
-                        Duration::from_secs(timeout),
-                    ).is_ok();
-                    if *up && !ok {
-                        crate::log::warn(&format!("active_health: {addr} DOWN"));
-                    } else if !*up && ok {
-                        crate::log::info(&format!("active_health: {addr} UP"));
+                for (addr, ok) in results {
+                    if let Some(up) = m.get_mut(&addr) {
+                        if *up && !ok {
+                            crate::log::warn(&format!("active_health: {addr} DOWN"));
+                        } else if !*up && ok {
+                            crate::log::info(&format!("active_health: {addr} UP"));
+                        }
+                        *up = ok;
                     }
-                    *up = ok;
                 }
             }
+        }
+        crate::log::info("active_health: thread stopped");
+    });
+    std::thread::spawn(move || {
+        if let Err(e) = handle.join() {
+            crate::log::error(&format!("active_health: thread panicked: {:?}", e));
         }
     });
 }

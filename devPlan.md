@@ -1,933 +1,301 @@
 # Proxycache Development Plan
-*Generated: 2026-02-11*
-*Last updated: Critical fixes completed*
+*Generated: 2026-02-12*
+*Last audit: 2026-02-12 — HTTP/2 + HTTP/3 support added*
+
+---
+
+## 📊 PROJECT HEALTH
+
+### ✅ What's Good
+- **Clean build**: 0 errors, 0 warnings
+- **Multi-protocol**: HTTP/1.1, HTTP/2 (ALPN on TLS), HTTP/3 (QUIC) all supported
+- **TLS**: Proper ALPN negotiation, session resumption cache (2048), 10s handshake timeout
+- **Test coverage**: 22 unit tests all passing (HTTP parsing, chunked encoding, config, metrics)
+- **Script module system**: Fully functional with STD library, priority system, and 13 example modules
+- **Security improvements**: Fixed request smuggling, overflow bugs, thread exhaustion, mutex poisoning recovery
+- **Documentation**: Complete README with architecture, module guide, CLI reference
+- **Concurrency**: Solid Arc/Atomic patterns, proper shutdown signal propagation (SHUTDOWN flag)
+- **Error handling**: Most panics eliminated, mutex poison recovery implemented across codebase
+
+### ⚠️ What's Bad
+- **Zero integration tests**: No end-to-end proxy behavior tests
+- **No benchmarks**: Unknown performance characteristics under load
+- **Missing production features**: No metrics persistence, no hot reload testing, no TLS backend connections
+- **Low-priority tech debt**: Platform-specific socket options, thread join visibility, config file race conditions
+
+### 🗺️ Short-Term Roadmap
+1. ~~**HTTP/2 + HTTP/3 support**~~ ✅ DONE
+2. **Integration test suite** (build server, send real HTTP, verify caching/rate-limiting)
+3. **Benchmarking harness** (wrk/ab tests with metrics collection)
+4. **Hot config reload** without restart
 
 ---
 
 ## 1. 🚨 CRITICAL ISSUES
 
-### 1.1 ✅ FIXED — Connection Pool Stale Connection Detection (pool.rs)
-**Fix:** Removed try_clone() approach. Now probes the actual stream directly: set nonblocking → peek read → restore blocking. Discards stream on any failure.
+### 1.1 ✅ FIXED — Load Balancer Division by Zero (load_balancer.rs + stdlib.rs)
+**Fix:** Added `len == 0` guard in `RoundRobin::handle()` that returns 503 error response. stdlib.rs already had `if backends.is_empty() { return; }` guard. Registration already falls back to `Single` when backends list is empty.
 
 ---
 
-### 1.2 ✅ FIXED — Mutex Poisoning Recovery (cache.rs, rate_limiter.rs, circuit_breaker.rs)
-**Fix:** All mutex lock sites now use `poisoned.into_inner()` to recover data after a panic. Rate limiter no longer fails open. Cache and circuit breaker recover gracefully with logged warnings.
+### 1.2 ✅ FIXED — Bidirectional Streaming Thread Resource Leak (helpers.rs)
+**Fix:** Added 120s read timeouts on both streams before spawning threads. Both threads now joined with panic logging. Clone failures logged instead of silently returning.
 
 ---
 
-### 1.3 ✅ FIXED — Chunked Transfer Encoding Parser (http/mod.rs)
-**Fix:** Complete rewrite of `find_zero_chunk()` to walk chunks forward with proper RFC-compliant hex size parsing, chunk extension support, and `\r\n` boundary validation. Body size limit enforced consistently for both content-length and chunked bodies.
+### 1.3 ✅ FIXED — Socket Reuse Without Validation (pool.rs)
+**Fix:** Added `take_error()` SO_ERROR check before probe. Added explicit `Ok(0)` (EOF/remote close) case that skips the socket instead of reusing it.
 
 ---
 
-### 1.4 ✅ FIXED — Circuit Breaker Race Condition (circuit_breaker.rs)
-**Fix:** All state transitions now use `compare_exchange()` instead of plain `store()`. Thread can only transition state if it's still in the expected state, preventing overwrites from concurrent threads.
+### 1.4 ✅ FIXED — Slow Client HTTP Body Read DOS (http/mod.rs)
+**Fix:** Added `MAX_READ_CALLS = 500` counter in `read_http_message()`. Returns error after 500 read syscalls to prevent CPU exhaustion from slow-drip clients.
 
 ---
 
-### 1.5 ✅ FIXED — Admin API Authentication (admin_api.rs, cli/main.go, cli/web_server.go)
-**Fix:** Added `api_key` config field, `X-API-Key` header extraction, auth check on all endpoints except `/ping`. CLI and web dashboard auto-read api_key from config.toml and send it with all admin API requests. Warns at startup if no key is set.
-
----
-
-### 1.6 ✅ FIXED — HTTP Request Line Parsing (http/request.rs)
-**Fix:** Added validation: HTTP method must be in allowed list (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS/CONNECT/TRACE), path cannot contain control characters, version must be HTTP/1.0 or HTTP/1.1, rejects extra tokens in request line.
+### 1.5 ✅ FIXED — API Key Timing Attack (admin_api.rs)
+**Fix:** Replaced `!=` comparison with `constant_time_eq()` using XOR accumulator. Different-length keys still do full-length work to prevent length leaking.
 
 ---
 
 ## 2. 🔧 CORE SYSTEM IMPROVEMENTS
 
-### 2.1 ✅ FIXED — Error Handling Infrastructure
-**Fix:** Replaced all `unwrap_or_default()` in build.rs with proper error logging via `cargo:warning`. Added `panic!` with context for fatal write failures. Replaced `unwrap()` on dir name with safe `and_then`. Added error logging for failed client response writes in server.rs. Config serialization failures now logged instead of silently returning empty string. Overload rejections now tracked in metrics.
+### 2.1 ✅ FIXED — Mutex Poison Recovery With State Validation
+**Severity:** HIGH  
+**Status:** FIXED  
+**Files:** cache.rs, stdlib.rs, pool.rs, rate_limiter.rs
+
+**Fix:** All mutex poison recovery paths now validate state after recovery:
+- **Pool**: Purges stale connections after poison (validates `created <= now`, removes aged entries)
+- **Pool put()**: Clears entire pool on poison recovery (safest — don't reuse connections from corrupt state)
+- **Cache**: Clears entire cache on poison recovery in `on_response()` and eviction thread
+- **Rate limiter**: Clears all buckets on poison recovery (forces re-creation of token buckets)
+- **Circuit breaker**: Validates `Instant` is not in future after poison; resets to `Duration::ZERO` if corrupt
 
 ---
 
-### 2.2 ✅ FIXED — Graceful Shutdown Enhancement
-**Fix:** Added configurable `shutdown_timeout` field to Srv config (default 15s). Shutdown now logs connection draining progress with active count. ThreadPool workers are explicitly joined via `shutdown()` method (sender dropped to signal workers, then `join()` on all handles). Changed `_workers` to `workers` with proper ownership.
+### 2.2 ✅ FIXED — Unbounded Memory Growth Under Attack
+**Severity:** HIGH  
+**Status:** FIXED  
+**Files:** rate_limiter.rs, cache.rs
+
+**Fix:**
+- **Rate limiter**: Hard cap `MAX_BUCKETS = 50,000`. When reached, first evicts stale entries (>300s), then force-evicts oldest 25% if still at cap. Replaces old threshold-only cleanup.
+- **Cache**: `on_response()` now uses `while m.len() >= max` loop instead of single `if`, ensuring insertions never exceed max even when multiple entries need eviction.
 
 ---
 
-### 2.3 ✅ FIXED — Configuration Validation
-**Fix:** `validate()` now returns `bool` — false if fatal issues found. Validates `listen_addr` and `backend_addr` as valid `SocketAddr` (ip:port format). Warns if `client_timeout < backend_timeout` (clients may time out before backend responds). Warns if `max_connections > 100_000` (file descriptor exhaustion risk). Falls back to default addresses if validation fails.
+### 2.3 ✅ FIXED — Script Parser Memory Limits
+**Severity:** MEDIUM  
+**Status:** FIXED  
+**Files:** parser.rs, loader.rs
+
+**Fix:**
+- **Loader**: Added 1MB file size check (`metadata().len() > 1_048_576`) before `read_to_string()` — rejects oversized .pcmod files with warning.
+- **Parser**: Added 10,000 line limit after `lines()` — returns error for scripts exceeding limit. Both limits applied in `collect_script_defaults()` and `load_script_modules()`.
 
 ---
 
-### 2.4 ⏭ DEFERRED — Memory Management and Limits
-**Reason:** Medium-low priority. Buffer pooling adds complexity for marginal gain at current scale. Better addressed during performance optimization phase.
+### 2.4 ✅ FIXED — Admin API Dynamic Buffer Reading
+**Severity:** MEDIUM  
+**Status:** FIXED  
+**File:** admin_api.rs
+
+**Fix:** Replaced fixed `[0u8; 4096]` buffer with dynamic read loop:
+- Reads in a loop until headers complete (`\r\n\r\n` found)
+- Parses `Content-Length` from headers to determine body size needed
+- Grows buffer to fit, capped at `MAX_ADMIN_REQUEST = 64KB`
+- Returns 413 "request too large" if Content-Length or total exceeds cap
+- Handles `WouldBlock`/`TimedOut` gracefully (treats as end of data)
 
 ---
 
-### 2.5 ✅ FIXED — Logging System Enhancement
-**Fix:** Added timestamps (UTC, format: `YYYY-MM-DD HH:MM:SS.mmm`) to all log lines. Added log level system with 4 levels: debug, info, warn, error. New `log_level` config field (default "info"). Level filtering applied to info, debug, warn — errors always shown. Added `DIM` color constant for timestamp rendering. Added `debug()` function for future use. Request/response logs include timestamps.
+### 2.5 ✅ FIXED — Config Reload Validates Invalid Fields
+**Severity:** MEDIUM  
+**Status:** FIXED  
+**File:** config.rs
+
+**Fix:** `load_config()` now fully rejects invalid configurations:
+- Invalid `listen_addr` → falls back to `127.0.0.1:3000` with warning
+- Invalid `backend_addr` → falls back to `127.0.0.1:8080` with warning
+- Invalid TLS config (missing cert or key, or files not found) → clears both fields, disables TLS with warning
+- All fallbacks logged explicitly so operator sees what changed
 
 ---
 
-### 2.6 ✅ FIXED — Build System Robustness
-**Fix:** Added per-file `cargo:rerun-if-changed` for proper incremental rebuilds. Added diagnostic output showing discovered module counts. Added empty-modules warnings. Generated file header now includes module count. All file operations use proper error handling (from 2.1 fixes).
+## 3. 🚀 MISSING FEATURES (Production Essentials)
 
----
-
-## 3. 🚀 CORE ADDITIONS (Missing Essentials)
-
-### 3.1 TLS/HTTPS Support
-**Status:** ✅ FIXED — TLS termination for client connections implemented
-
-**What was done:**
-- Added `rustls 0.23` (with `ring` crypto backend) and `rustls-pemfile 2` dependencies
-- Created `ClientStream` enum (`Plain`/`Tls`) wrapping `TcpStream` and `StreamOwned<ServerConnection, TcpStream>`
-- `ClientStream` implements `Read`, `Write`, and delegates socket ops (peer_addr, timeouts, nodelay, shutdown)
-- `build_tls_config()` loads cert/key PEM files, builds `ServerConfig` with `with_single_cert()`
-- Accept loop wraps TcpStream in TLS `StreamOwned` when cert/key are configured
-- Automatic handshake on first read/write (StreamOwned handles this transparently)
-- Config: `tls_cert` and `tls_key` fields in `[server]` section, validated at startup (both must exist if either set, files must exist)
-- Raw TCP handler mode warns and rejects when TLS is active (incompatible by design)
-- Crypto provider: ring (no cmake/nasm build dependencies)
-
-**Still missing (future work):**
-- TLS for backend connections (outgoing)
-- SNI support for multiple certificates
-- ACME/Let's Encrypt integration
-- Certificate hot-reload
-
-**Priority:** Done (core functionality)
-
----
-
-### 3.2 HTTP/2 and HTTP/3 Support
-**Status:** DEFERRED — Requires async runtime rewrite (incompatible with current sync I/O model)
-
-**Current:** Only HTTP/1.1 supported
+### 3.1 Integration Test Suite
+**Status:** MISSING  
+**Priority:** HIGH
 
 **Need:**
-- HTTP/2 with multiplexing
-- QUIC/HTTP/3 for modern clients
-- Protocol negotiation (ALPN)
-
-**Priority:** HIGH (deferred)
-
----
-
-### 3.3 WebSocket Support
-**Status:** DEFERRED — User chose to defer
-
-**Current:** Raw TCP module exists but no WebSocket framing
-
-**Need:**
-- WebSocket handshake handling
-- Frame parsing
-- Bidirectional message passing
-- Ping/pong keepalive
-
-**Priority:** MEDIUM (deferred)
+- Start real server on ephemeral port
+- Send HTTP requests via `reqwest` or `hyper` client
+- Verify: caching (cache hit headers), rate limiting (429 responses), compression (gzip encoding), load balancing (request distribution)
+- Verify graceful shutdown doesn't drop in-flight requests
 
 ---
 
-### 3.4 Request/Response Body Streaming
-**Status:** DEFERRED — User chose to defer
-
-**Current:** Entire request/response loaded into memory
+### 3.2 Benchmarking & Load Testing
+**Status:** MISSING  
+**Priority:** HIGH
 
 **Need:**
-- Stream large uploads to backend without full buffering
-- Stream large downloads to client
-- Configurable streaming thresholds
-
-**Priority:** MEDIUM (deferred)
+- `wrk` or `ab` integration with metrics collection
+- Measure: requests/sec, latency p50/p95/p99, memory growth over time
+- Compare: with/without modules enabled, Rust vs compiled .pcmod scripts
+- Detect performance regressions in CI
 
 ---
 
-### 3.5 Observability & Tracing
-**Status:** BASIC - Needs enhancement
-
-**Current:** Simple metrics counter, no distributed tracing
-
-**Need:**
-- OpenTelemetry integration
-- Distributed tracing (trace IDs propagation)
-- Span tracking through pipeline
-- Jaeger/Zipkin export
-- Better Prometheus metrics (histograms, not just counters)
-
+### 3.3 Hot Config Reload
+**Status:** PARTIAL (code exists but untested)  
 **Priority:** MEDIUM
 
----
-
-### 3.6 Advanced Health Checks
-**Status:** BASIC
-
-**Current:** Simple TCP connect checks
-
 **Need:**
-- HTTP health check endpoints
-- Custom health check scripts
-- Multiple health check strategies per backend
-- Gradual recovery (weighted traffic)
-- Health check results in metrics
-
-**Priority:** MEDIUM-LOW
+- Test reload endpoint actually reloads modules
+- Validate no dropped connections during reload
+- Rollback mechanism if new config is invalid
+- Signal modules to refresh their config (cache TTL, rate limits, etc.)
 
 ---
 
-### 3.7 Plugin System
-**Status:** SEMI-MANUAL
-
-**Current:** Modules require recompilation
-
-**Need:**
-- WASM plugin support for custom logic
-- Hot-reload of plugins
-- Plugin sandboxing
-- Plugin marketplace/registry
-
-**Priority:** LOW (future enhancement)
-
----
-
-### 3.8 Persistent Cache Backend
-**Status:** MISSING - In-memory only
-
-**Current:** Cache is in-memory HashMap (cache.rs)
-
-**Need:**
-- Redis integration
-- Memcached support
-- Disk-based cache option
-- Cache invalidation API
-- Cache warming strategies
-
+### 3.4 Metrics Persistence & Prometheus Integration
+**Status:** PARTIAL (Prometheus endpoint exists)  
 **Priority:** MEDIUM
 
+**Need:**
+- Persist metrics across restarts (write to disk periodically)
+- Histogram support (latency distribution, not just max)
+- Grafana dashboard templates
+- Alerting rules for high error rate / circuit breaker trips
+
 ---
 
-### 3.9 Authentication & Authorization Module
+### 3.5 TLS Backend Connections
+**Status:** MISSING  
+**Priority:** MEDIUM
+
+**Need:**
+- HTTPS support for backend servers (currently only HTTP)
+- SNI configuration for multiple backends
+- Certificate validation (or optional skip for testing)
+
+---
+
+## 4. 📝 DOCUMENTATION & TOOLING
+
+### 4.1 Performance Tuning Guide
 **Status:** MISSING
 
 **Need:**
-- JWT validation
-- OAuth2/OIDC integration
-- API key management
-- Rate limiting per user/key
-- ACL system
-
-**Priority:** MEDIUM
+- Recommended buffer sizes for different workloads
+- Connection pool sizing guidelines
+- Module priority ordering best practices
+- Profiling instructions
 
 ---
 
-### 3.10 Request/Response Transformation
-**Status:** BASIC (url_rewriter only)
-
-**Current:** Only URL path rewriting
+### 4.2 Security Hardening Guide
+**Status:** MISSING
 
 **Need:**
-- Header transformation rules
-- Body transformation (JSON, XML)
-- Template-based rewrites
-- Regex-based matching
-- Request enrichment (inject headers)
-
-**Priority:** LOW
+- TLS cipher suite recommendations
+- Rate limiting configuration for production
+- API key management best practices
+- Network segmentation examples (admin API on separate interface)
 
 ---
 
-## 4. 🎨 GENERAL IMPROVEMENTS
+### 4.3 Module Development Tutorial
+**Status:** PARTIAL (README has basics)
 
-### 4.1 Code Organization & Documentation
-
-**Issues:**
-- Minimal inline documentation
-- No examples directory
-- No architecture diagram
-- Module relationships not documented
-
-**Improvements:**
-- Add comprehensive rustdoc comments
-- Create examples/ directory with usage examples
-- Architecture documentation (diagrams)
-- Module interaction guide
-- Performance tuning guide
-
-**Priority:** MEDIUM
+**Need:**
+- Step-by-step .pcmod creation walkthrough
+- STD library reference with all functions documented
+- Common patterns (authentication, request transformation, logging)
+- Debugging techniques for script modules
 
 ---
 
-### 4.2 Testing Infrastructure
+## 5. 🧹 TECHNICAL DEBT
 
-**Current State:** NO TESTS FOUND
+### 5.1 ✅ FIXED — Socket Options Platform Portability
+**Severity:** LOW  
 
-**Critical Needs:**
-- Unit tests for all modules
-- Integration tests for HTTP pipeline
-- Load testing framework
-- Chaos testing (network failures, backend crashes)
-- Regression test suite
-- CI/CD pipeline
-
-**Priority:** CRITICAL
+**Fix:** Removed platform-specific `setsockopt` with `libc::timeval` struct. Unified to use Rust's `set_nonblocking(true)` + 50ms poll sleep on all platforms. The unix-only `#[cfg(not(windows))]` block with unsafe `setsockopt` is gone. Unix signal handling still uses libc (necessary).
 
 ---
 
-### 4.3 Performance Optimizations
+### 5.2 ✅ FIXED — Thread Join Failure Handling
+**Severity:** LOW  
+**Files:** cache.rs, active_health.rs
 
-**Opportunities:**
-- HTTP parser optimization (zero-copy where possible)
-- Better thread pool tuning
-- Connection pool improvements (LRU eviction)
-- Response caching with etag support
-- Kernel bypass networking (io_uring on Linux)
-- SIMD for header parsing
-
-**Priority:** MEDIUM-LOW
+**Fix:** Both background threads (cache eviction, active health) now have a lightweight monitor thread that calls `handle.join()`. If the worker panics, the monitor logs the panic via `crate::log::error()`. This surfaces previously-silent panics without storing JoinHandles in module state.
 
 ---
 
-### 4.4 Configuration Management
+### 5.3 ✅ FIXED — Config File Race Conditions
+**Severity:** LOW  
+**File:** config.rs
 
-**Improvements:**
-- Environment variable support
-- Hot-reload configuration without restart
-- Configuration validation API endpoint
-- Config diff/history
-- Migration tool for config format changes
-- JSON/YAML config format support
-
-**Priority:** MEDIUM
+**Fix:** Added `atomic_write()` function that writes to `{path}.tmp` then renames to `{path}`. This prevents corruption from crashes mid-write. All config writes (generation, update) now use `atomic_write()` instead of direct `fs::write()`.
 
 ---
 
-### 4.5 Dependency Management
+### 5.4 ✅ FIXED — Type Conversions Overhead
+**Severity:** LOW  
+**Files:** request_id.rs, helpers.rs
 
-**Current:** Minimal dependencies (good!)
-
-**Review:**
-- `serde`, `toml`, `flate2` - all good
-- Missing: TLS library
-- Missing: Async runtime (tokio/async-std) for better concurrency
-
-**Consideration:** Evaluate async/await vs current thread-per-connection model
-
-**Priority:** MEDIUM
+**Fix:**
+- `config_u64()` and `config_usize()` now use `u64::try_from()` / `usize::try_from()` instead of `as` casts — negative TOML values now fall back to defaults instead of wrapping silently
+- `COUNTER` wrapping behavior documented explicitly in comment
+- Header name `"X-Request-Id"` extracted to `const HDR_REQUEST_ID` to avoid repeated literal allocations
 
 ---
 
-### 4.6 Cross-Platform Support
+## 6. ✅ RECENTLY FIXED (Reference Only)
 
-**Current:** Windows-specific code exists (server.rs:128-142, 289-302)
-
-**Issues:**
-- Unix code uses raw libc calls
-- Not tested on macOS
-- No BSD support explicitly
-
-**Improvements:**
-- Use cross-platform abstractions
-- Test on multiple platforms
-- Document platform-specific features
-- Create platform-specific binaries in CI
-
-**Priority:** LOW
-
----
-
-### 4.7 Resource Limits & Protection
-
-**Missing:**
-- Per-client connection limits
-- Request rate limiting per IP (module exists but could be enhanced)
-- File descriptor limits monitoring
-- Memory usage caps
-- CPU usage monitoring
-- Backpressure mechanisms
-
-**Priority:** MEDIUM
+- **1.x Active Health Check**: Added shutdown signal, moved I/O outside write lock, validated backends
+- **1.x HTTP Chunked Encoding**: Fixed operator precedence, added checked arithmetic, bounds validation
+- **1.x TLS Config Validation**: Fixed OR→AND logic, added write error handling
+- **1.x Server Atomics**: Changed to AcqRel ordering, removed unwrap in shutdown
+- **1.x Admin API**: Added connection limit (16 max), shutdown-aware accept loop
+- **1.x Load Balancer**: Added division-by-zero guard, returns 503 on empty backends
+- **1.x Bidirectional Streaming**: Added 120s read timeouts, panic-safe joins
+- **1.x Socket Pool**: Added SO_ERROR check, explicit EOF detection
+- **1.x Slow Client DOS**: Added 500 read-call limit in HTTP parser
+- **1.x API Key Security**: Constant-time comparison to prevent timing attacks
+- **2.x Silent Errors**: Added logging for pool/helpers/config errors
+- **2.x Metrics Overflow**: Capped latency at 600s
+- **2.x Log Consistency**: error() now checks active() before logging
+- **5.x Cache Max Size**: Enforces limit with LRU eviction, uses configured backend
+- **5.x Socket Portability**: Removed unsafe setsockopt, unified to cross-platform non-blocking accept
+- **5.x Thread Join Handling**: Cache eviction + active health threads now monitored, panics logged
+- **5.x Config Atomic Write**: Write-to-tmp + rename prevents crash corruption
+- **5.x Type Safety**: Safe try_from casts, documented counter wrapping, header constant extracted
+- **2.x Mutex Poison Recovery**: All poison recovery paths validate state, clear corrupt data
+- **2.x Unbounded Memory**: Rate limiter capped at 50K buckets with force-eviction, cache enforces max in loop
+- **2.x Script Parser Limits**: 1MB file size + 10K line cap in parser and loader
+- **2.x Admin API Buffer**: Dynamic read loop with Content-Length parsing, 64KB cap, 413 on overflow
+- **2.x Config Reload**: Invalid addresses/TLS fall back to safe defaults with explicit warnings
+- **Streamlining**: Removed duplicate ConnPool in proxy_core (uses global_pool()), eliminated unused COUNTERS HashMap in metrics, unified snapshot() for prometheus/json, fixed dead TLS validation logic, simplified config path parser
 
 ---
 
-### 4.8 Developer Experience (CLI)
-
-**Current:** Go-based CLI is well-designed!
-
-**Improvements:**
-- Add shell completion (bash, zsh, fish)
-- Add `watch` mode for logs
-- Add performance profiling command
-- Add config linting/validation command
-- Better error messages
-
-**Priority:** LOW
-
----
-
-## 5. 🔬 SPECIFIC IMPROVEMENTS
-
-### 5.1 HTTP Parser (http/mod.rs)
-
-**Issues:**
-- Manual byte searching inefficient
-- No pipelining support
-- Chunked encoding parser incomplete
-
-**Improvements:**
-- Use `httparse` crate for robust parsing
-- Support HTTP pipelining
-- Better chunked encoding support
-- Request smuggling prevention
-
-**Priority:** HIGH
-
----
-
-### 5.2 Connection Pool (pool.rs)
-
-**Issues:**
-- Simple HashMap, no LRU eviction
-- No per-backend connection limits
-- No pool statistics
-- No connection health validation
-
-**Improvements:**
-- LRU eviction policy
-- Per-backend connection limits
-- Pool metrics (size, hit rate, stale evictions)
-- Periodic connection validation
-- DNS-aware pooling (re-resolve backends)
-
-**Priority:** MEDIUM
-
----
-
-### 5.3 Cache Module (cache.rs)
-
-**Issues:**
-- No cache key customization
-- No vary header support
-- Hard-coded TTL
-- No cache purge API
-- Warm cache uses hard-coded backend address (line 68)
-
-**Improvements:**
-- Configurable cache key generation
-- Vary header support
-- Per-response TTL (Cache-Control headers)
-- Cache purge/invalidation API
-- Better warming strategy (from config, not hardcoded)
-- Cache size limits (currently ignored - line 82)
-
-**Priority:** MEDIUM
-
----
-
-### 5.4 Rate Limiter (rate_limiter.rs)
-
-**Issues:**
-- Token bucket only, no other algorithms
-- Per-IP only, no other identifiers
-- Cleanup threshold hardcoded (line 9)
-- No distributed rate limiting
-
-**Improvements:**
-- Multiple algorithms (leaky bucket, fixed window, sliding window)
-- Rate limit by header (API key, user ID)
-- Better cleanup strategy
-- Distributed rate limiting (Redis-backed)
-- Rate limit headers in response (X-RateLimit-*)
-
-**Priority:** MEDIUM
-
----
-
-### 5.5 Circuit Breaker (circuit_breaker.rs)
-
-**Issues:**
-- Race conditions (covered in Critical)
-- No gradual recovery
-- No circuit breaker metrics beyond trips/rejects
-- Half-open state allows only one request
-
-**Improvements:**
-- Fix race conditions (use proper state machine)
-- Gradual recovery (start with small percentage)
-- Detailed metrics (state duration, success rate in half-open)
-- Configurable half-open request count
-
-**Priority:** MEDIUM
-
----
-
-### 5.6 Load Balancer (load_balancer.rs)
-
-**Issues:**
-- Round-robin only
-- No weighted backends
-- No session affinity
-- No slow-start
-
-**Improvements:**
-- Multiple algorithms (least-connections, random, weighted)
-- Session affinity (sticky sessions by IP/cookie)
-- Weighted round-robin
-- Slow-start for recovering backends
-- Active/passive backend modes
-
-**Priority:** MEDIUM
-
----
-
-### 5.7 Compression (compression.rs)
-
-**Issues:**
-- Gzip only
-- No brotli support
-- No compression level configuration
-- Content-type allowlist hardcoded
-
-**Improvements:**
-- Brotli support
-- Zstd support
-- Configurable compression levels
-- Configurable content-type filters
-- Compression ratio metrics
-- Skip already compressed content
-
-**Priority:** LOW
-
----
-
-### 5.8 Request ID (request_id.rs)
-
-**Issues:**
-- Sequential counter could reveal traffic volume
-- Timestamp in micros might have collisions
-
-**Improvements:**
-- Use UUID v7 (time-ordered, random)
-- Option to use user-provided format
-- Include hostname/instance ID for distributed systems
-
-**Priority:** LOW
-
----
-
-### 5.9 Metrics (metrics.rs)
-
-**Issues:**
-- Only counters and basic gauges
-- No histograms
-- No percentiles
-- Latency tracking is sum only (can't compute average properly if it resets)
-
-**Improvements:**
-- Histogram support (latency distribution)
-- Percentiles (p50, p95, p99)
-- Per-backend metrics
-- Per-route metrics
-- Metrics retention/windowing
-- OpenMetrics format support
-
-**Priority:** MEDIUM
-
----
-
-### 5.10 Admin API (admin_api.rs)
-
-**Issues:**
-- Manual HTTP parsing instead of using framework
-- No request validation
-- No authentication (covered in Critical)
-- Limited endpoints
-
-**Improvements:**
-- Use lightweight HTTP framework (warp/axum)
-- Add authentication (covered in Critical)
-- Add CORS properly (currently wildcard)
-- Add API versioning
-- Add OpenAPI spec
-- More admin endpoints (force cache clear, connection pool stats, etc.)
-
-**Priority:** MEDIUM
-
----
-
-### 5.11 Web Dashboard (cli/web_html.go)
-
-**Issues:**
-- Embedded HTML (hard to maintain)
-- No build process for frontend
-- No tests for web UI
-
-**Improvements:**
-- Separate frontend project (React/Vue/Svelte)
-- Build process (webpack/vite)
-- Real-time updates (WebSockets/SSE)
-- More visualizations (graphs, charts)
-- Mobile-responsive improvements
-- Dark mode toggle
-
-**Priority:** LOW
-
----
-
-## 6. 📋 IMPLEMENTATION ROADMAP
-
-### Phase 1: Critical Fixes & Security (Weeks 1-3)
-**Goal:** Make production-ready
-
-1. Fix connection pool stale detection (#1.1)
-2. Add admin API authentication (#1.5)
-3. Fix HTTP parser vulnerabilities (#1.3, #1.6)
-4. Fix circuit breaker race condition (#1.4)
-5. Implement proper error handling (#2.1)
-6. Add basic test suite (#4.2)
-
-**Deliverable:** Stable, secure proxy for production testing
-
----
-
-### Phase 2: Core Infrastructure (Weeks 4-6)
-**Goal:** Production-grade infrastructure
-
-1. Add TLS support (#3.1)
-2. Improve metrics & observability (#3.5)
-3. Add comprehensive logging (#2.5)
-4. Implement graceful shutdown (#2.2)
-5. Add configuration validation (#2.3)
-6. Fix mutex poisoning recovery (#1.2)
-
-**Deliverable:** Enterprise-ready proxy with monitoring
-
----
-
-### Phase 3: Modern Protocols (Weeks 7-9)
-**Goal:** Support modern web
-
-1. HTTP/2 support (#3.2)
-2. WebSocket support (#3.3)
-3. Request/response streaming (#3.4)
-4. Advanced health checks (#3.6)
-
-**Deliverable:** Full-featured modern reverse proxy
-
----
-
-### Phase 4: Advanced Features (Weeks 10-14)
-**Goal:** Feature parity with major proxies
-
-1. Persistent cache backend (#3.8)
-2. Authentication & authorization (#3.9)
-3. Advanced request transformation (#3.10)
-4. Enhanced rate limiting (#5.4)
-5. Enhanced load balancing (#5.6)
-6. Memory management improvements (#2.4)
-
-**Deliverable:** Feature-complete reverse proxy
-
----
-
-### Phase 5: Performance & Polish (Weeks 15-18)
-**Goal:** Optimization & developer experience
-
-1. Performance optimizations (#4.3)
-2. Async runtime evaluation (#4.5)
-3. Enhanced testing (#4.2)
-4. Documentation (#4.1)
-5. Developer tooling (#4.8)
-6. Cross-platform testing (#4.6)
-
-**Deliverable:** Optimized, well-documented, production-hardened proxy
-
----
-
-### Phase 6: Future Enhancements (Ongoing)
-**Goal:** Innovation & extensibility
-
-1. Plugin system (#3.7)
-2. HTTP/3 support (#3.2)
-3. Advanced compression (#5.7)
-4. AI-based traffic analysis
-5. Service mesh integration
-6. Edge computing features
-
----
-
-## 7. 💡 INNOVATIVE IDEAS
-
-### 7.1 AI-Powered Traffic Analysis
-**Concept:** Use ML to detect anomalies and optimize routing
-
-**Features:**
-- Automatic DDoS detection based on traffic patterns
-- Predictive scaling recommendations
-- Smart cache warming based on access patterns
-- Anomaly detection (unusual request patterns)
-- Auto-tuning of circuit breaker thresholds
-
-**Implementation:** Separate analytics service that consumes metrics
-
----
-
-### 7.2 Smart Retry with Backoff
-**Concept:** Intelligent retry logic for failed requests
-
-**Features:**
-- Exponential backoff
-- Retry budget (limit retries to prevent cascade)
-- Selective retry (only idempotent methods)
-- Retry after backend recovery detection
-- Cross-request learning (don't retry if backend is known down)
-
----
-
-### 7.3 Multi-Region Failover
-**Concept:** Route to different backend regions based on health
-
-**Features:**
-- Region-aware load balancing
-- Automatic failover to healthy regions
-- Latency-based routing
-- Geographic load distribution
-- Split-brain prevention
-
----
-
-### 7.4 Request Replay & Debugging
-**Concept:** Capture and replay requests for debugging
-
-**Features:**
-- Traffic shadowing (send to prod + test simultaneously)
-- Request recording with privacy controls
-- Replay tool for debugging
-- A/B testing support
-- Canary deployments
-
----
-
-### 7.5 Dynamic Configuration via Control Plane
-**Concept:** Central control plane for managing multiple proxy instances
-
-**Features:**
-- Config pushed from central server
-- Fleet management
-- Coordinated deployments
-- Shared state (distributed cache, rate limits)
-- Service discovery integration
-
----
-
-### 7.6 Blockchain-Based Rate Limiting
-**Concept:** Distributed, tamper-proof rate limiting for API gateways
-
-**Features:**
-- Shared rate limit state across instances
-- Proof-of-work for expensive endpoints
-- Immutable audit log
-- Token-based access control
-
-**Note:** Experimental/academic interest
-
----
-
-### 7.7 Request Transformation DSL
-**Concept:** Domain-specific language for complex transformations
-
-**Features:**
-- SQL-like query language for headers/body
-- Lua/WASM scripting for complex logic
-- Template engine for responses
-- GraphQL query transformation
-- Data masking/PII redaction
-
----
-
-### 7.8 Protocol Translation Gateway
-**Concept:** Translate between different protocols
-
-**Features:**
-- REST → gRPC translation
-- GraphQL → REST translation  
-- SOAP → REST translation
-- Message queue integration (HTTP → Kafka)
-- Event stream conversion
-
----
-
-### 7.9 Developer Productivity Features
-**Concept:** Make development with Proxycache delightful
-
-**Features:**
-- Local dev mode with mock backends
-- Request/response interceptor UI
-- GraphQL playground integration
-- API documentation generator from traffic
-- cURL command generator for any request
-- Postman collection exporter
-
----
-
-### 7.10 Zero-Downtime Binary Updates
-**Concept:** Update proxy binary without dropping connections
-
-**Features:**
-- File descriptor passing between processes
-- Graceful binary swap
-- Rollback capability
-- Version testing in parallel
-- Automated health checks before swap
-
-**Implementation:** Similar to nginx graceful reload
-
----
-
-### 7.11 Machine Learning Cache Optimization
-**Concept:** Use ML to optimize cache efficiency
-
-**Features:**
-- Predict cache hit likelihood
-- Adaptive TTL based on access patterns
-- Smart prefetching
-- Cache warming optimization
-- Eviction policy learning
-
----
-
-### 7.12 Built-in API Gateway Features
-**Concept:** Evolve from reverse proxy to full API gateway
-
-**Features:**
-- GraphQL federation
-- API composition (merge multiple backends)
-- Schema validation (OpenAPI/GraphQL)
-- Mock server mode
-- Contract testing
-- API analytics dashboard
-
----
-
-## 8. 📊 METRICS FOR SUCCESS
-
-### Code Quality Metrics
-- [ ] Test coverage > 80%
-- [ ] Zero clippy warnings
-- [ ] Zero unsafe code blocks (or all unsafe blocks documented)
-- [ ] All public APIs documented
-- [ ] No unwrap() in production code paths
-
-### Performance Metrics
-- [ ] < 1ms added latency (p50)
-- [ ] < 5ms added latency (p99)
-- [ ] > 100k requests/second (single instance)
-- [ ] < 50MB memory overhead (idle)
-- [ ] Linear scaling with worker threads
-
-### Reliability Metrics  
-- [ ] > 99.99% uptime
-- [ ] < 0.01% error rate
-- [ ] Zero crashes under normal operation
-- [ ] Graceful degradation under overload
-- [ ] Recovery from all failure modes within 30s
-
-### Security Metrics
-- [ ] Zero critical vulnerabilities (per security audit)
-- [ ] Pass OWASP proxy security checklist
-- [ ] No secrets in logs
-- [ ] All admin APIs authenticated
-- [ ] Rate limiting on all endpoints
-
----
-
-## 9. 🎯 PRIORITIZATION MATRIX
-
-### Must Have (Before v1.0)
-- Critical security fixes (#1.5, #1.6)
-- Connection pool fixes (#1.1)
-- TLS support (#3.1)
-- Comprehensive testing (#4.2)
-- Error handling (#2.1)
-- Basic observability (#3.5)
-
-### Should Have (v1.x)
-- HTTP/2 (#3.2)
-- WebSocket (#3.3)
-- Mutex recovery (#1.2)
-- Advanced health checks (#3.6)
-- Auth module (#3.9)
-- Persistent cache (#3.8)
-
-### Nice to Have (v2.0+)
-- HTTP/3 (#3.2)
-- Plugin system (#3.7)
-- Performance optimizations (#4.3)
-- Advanced features (#5.x)
-- ML features (#7.1, #7.11)
-
-### Future/Experimental
-- Blockchain features (#7.6)
-- Protocol translation (#7.8)
-- Service mesh (#6.6)
-
----
-
-## 10. 🔍 FRESH PERSPECTIVE OBSERVATIONS
-
-### What This Project Does REALLY Well
-
-1. **Module Auto-Discovery**: The build.rs auto-discovery is clever and reduces boilerplate
-2. **Clean Architecture**: Clear separation between core, modules, and HTTP handling
-3. **Minimal Dependencies**: Shows restraint, keeps binary size small
-4. **Pipeline Pattern**: The module pipeline with overrides is elegant
-5. **Developer Tooling**: The Go CLI and web dashboard show care for UX
-6. **Lock-Free Metrics**: Using atomics for metrics is smart
-
-### Unique Selling Points to Emphasize
-
-1. **Zero-Config Defaults**: Generates config if missing - great DX
-2. **Module Override System**: Allows advanced users to replace core modules
-3. **Hex Grid Config UI**: Unique, visually appealing configuration interface
-4. **Integrated Developer Tools**: CLI + Web UI + Proxy in one project
-5. **Lightweight**: No heavy runtime, compiles to single binary
-
-### Recommended Positioning
-
-**"The Developer-First Reverse Proxy"**
-
-Focus on:
-- **Fast iteration**: Built-in compilation, hot reload
-- **Visual configuration**: Hex grid UI is unique
-- **Batteries included**: Cache, rate limiting, circuit breaker out of box
-- **Hackable**: Clear module system, easy to extend
-
-Target Audience:
-- Solo developers building side projects
-- Small teams needing simple reverse proxy
-- Developers who want to understand proxy internals
-- Edge computing / embedded use cases
-
-### Differentiation from Competition
-
-vs **nginx**: More modern, easier config, better developer tools  
-vs **Envoy**: Simpler, no complex YAML, integrated UI  
-vs **Traefik**: Lighter weight, no container requirement, cleaner config  
-vs **Caddy**: Different focus (Caddy = automatic TLS, Proxycache = developer tools)
-
----
-
-## CONCLUSION
-
-Proxycache is a **solid foundation** with great developer ergonomics and clean architecture. The critical path to production readiness is:
-
-1. Fix security/reliability issues (Phase 1)
-2. Add TLS and modern protocol support (Phase 2-3)
-3. Enhance with advanced features (Phase 4)
-4. Polish and optimize (Phase 5)
-
-The unique hex grid UI and integrated tooling are standout features that should be emphasized. With the fixes and additions outlined above, this could become a popular choice for developers seeking a lightweight, hackable reverse proxy.
-
-**Total estimated effort:** 18-24 weeks for production-ready v1.0 with TLS and HTTP/2
-
-**Recommended first steps:**
-1. Add test suite
-2. Fix critical security issues  
-3. Implement TLS
-4. Add proper error handling
-5. Write documentation
-
-Good luck! 🚀
+## 📊 ISSUE STATISTICS
+
+| Severity | Count | Fixed | Remaining |
+|----------|-------|-------|-----------|
+| CRITICAL | 9 | **9** | **0** |
+| HIGH | 9 | **9** | **0** |
+| MEDIUM | 5 | **5** | **0** |
+| LOW | 4 | **4** | **0** |
+| **TOTAL** | **27** | **27** | **0** |
+
+**Test Coverage:** 22 unit tests (HTTP, chunked, config, metrics)  
+**Build Status:** ✅ 0 errors, 0 warnings  
+**Documentation:** ✅ README complete
+
+###

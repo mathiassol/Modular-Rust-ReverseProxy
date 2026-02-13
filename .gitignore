@@ -1,4 +1,37 @@
-/.proxycache-web.toml
-/.proxycache.err
-/.proxycache.log
+# Build artifacts
 /target
+Cargo.lock
+
+# Runtime files
+.proxycache-web.toml
+.proxycache.err
+.proxycache.log
+.proxycache.pid
+
+# TLS certificates (local dev)
+cert.pem
+key.pem
+
+# Config (local)
+config.toml
+
+# Binary executables
+*.exe
+*.exe~
+/cli/proxycache-cli
+/cli/proxycache-cli.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Modules and imports (runtime directories)
+/mods/
+/imports/

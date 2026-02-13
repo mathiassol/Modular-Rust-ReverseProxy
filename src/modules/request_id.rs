@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const HDR_REQUEST_ID: &str = "X-Request-Id";
+
 pub fn default_config() -> toml::Table {
     let mut t = toml::Table::new();
     t.insert("enabled".into(), toml::Value::Boolean(false));
@@ -30,17 +32,17 @@ impl Module for RequestId {
     fn name(&self) -> &str { "request_id" }
 
     fn handle(&self, r: &mut HttpRequest, c: &mut Context) -> Option<HttpResponse> {
-        let id = r.get_header("X-Request-Id")
+        let id = r.get_header(HDR_REQUEST_ID)
             .map(|s| s.to_string())
             .unwrap_or_else(generate_id);
-        r.set_header("X-Request-Id", &id);
+        r.set_header(HDR_REQUEST_ID, &id);
         c.set("_request_id", id);
         None
     }
 
     fn on_response(&self, _req: &HttpRequest, resp: &mut HttpResponse, ctx: &mut Context) {
         if let Some(id) = ctx.get("_request_id") {
-            resp.headers.push(("X-Request-Id".to_string(), id.to_string()));
+            resp.headers.push((HDR_REQUEST_ID.to_string(), id.to_string()));
         }
     }
 }

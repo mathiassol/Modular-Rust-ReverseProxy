@@ -22,15 +22,16 @@ pub fn register(ctx: &mut super::ModuleContext) {
     let max = h::config_usize(ctx.config, "cache", "max_size", 100);
     let urls = h::config_vec_str(ctx.config, "cache", "warm_urls");
     let cache = Arc::new(Mutex::new(HashMap::new()));
+    let backend = ctx.server.backend_addr.clone();
     if !urls.is_empty() {
-        warm_cache(Arc::clone(&cache), urls);
+        warm_cache(Arc::clone(&cache), urls, backend);
     }
     start_eviction_thread(Arc::clone(&cache));
-    ctx.pipeline.add(Box::new(Cache { cache, _ttl: ttl, _max: max }));
+    ctx.pipeline.add(Box::new(Cache { cache, ttl, max }));
 }
 
 fn start_eviction_thread(cache: Arc<Mutex<HashMap<String, Entry>>>) {
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(30));
             if crate::server::SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
@@ -38,7 +39,12 @@ fn start_eviction_thread(cache: Arc<Mutex<HashMap<String, Entry>>>) {
             }
             let mut m = match cache.lock() {
                 Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+                Err(poisoned) => {
+                    crate::log::warn("cache: eviction thread recovered poisoned mutex, clearing");
+                    let mut inner = poisoned.into_inner();
+                    inner.clear();
+                    inner
+                }
             };
             let before = m.len();
             let now = Instant::now();
@@ -48,17 +54,28 @@ fn start_eviction_thread(cache: Arc<Mutex<HashMap<String, Entry>>>) {
                 crate::log::info(&format!("cache: evicted {evicted} expired ({} left)", m.len()));
             }
         }
+        crate::log::info("cache: eviction thread stopped");
+    });
+    thread::spawn(move || {
+        if let Err(e) = handle.join() {
+            crate::log::error(&format!("cache: eviction thread panicked: {:?}", e));
+        }
     });
 }
 
-fn warm_cache(c: Arc<Mutex<HashMap<String, Entry>>>, urls: Vec<String>) {
+fn warm_cache(c: Arc<Mutex<HashMap<String, Entry>>>, urls: Vec<String>, backend: String) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(2));
         for u in urls {
-            if let Ok(resp) = fetch(&u) {
+            if let Ok(resp) = fetch(&u, &backend) {
                 let mut m = match c.lock() {
                     Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
+                    Err(poisoned) => {
+                        crate::log::warn("cache: warm_cache recovered poisoned mutex, clearing");
+                        let mut inner = poisoned.into_inner();
+                        inner.clear();
+                        inner
+                    }
                 };
                 m.insert(u, Entry { resp, exp: Instant::now() + Duration::from_secs(300) });
             }
@@ -66,10 +83,10 @@ fn warm_cache(c: Arc<Mutex<HashMap<String, Entry>>>, urls: Vec<String>) {
     });
 }
 
-fn fetch(u: &str) -> Result<HttpResponse, ()> {
+fn fetch(u: &str, backend: &str) -> Result<HttpResponse, ()> {
     use std::io::Write;
     use std::net::TcpStream;
-    let mut s = TcpStream::connect("127.0.0.1:8080").map_err(|_| ())?;
+    let mut s = TcpStream::connect(backend).map_err(|_| ())?;
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", u);
     s.write_all(req.as_bytes()).map_err(|_| ())?;
@@ -82,8 +99,8 @@ fn fetch(u: &str) -> Result<HttpResponse, ()> {
 
 struct Cache {
     cache: Arc<Mutex<HashMap<String, Entry>>>,
-    _ttl: u64,
-    _max: usize,
+    ttl: u64,
+    max: usize,
 }
 
 struct Entry {
@@ -136,11 +153,25 @@ impl Module for Cache {
             let key = _req.path.clone();
             let mut m = match self.cache.lock() {
                 Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+                Err(poisoned) => {
+                    crate::log::warn("cache: mutex recovered after panic, clearing cache");
+                    let mut inner = poisoned.into_inner();
+                    inner.clear();
+                    inner
+                }
             };
+            while m.len() >= self.max {
+                let oldest = m.iter()
+                    .min_by_key(|(_, e)| e.exp)
+                    .map(|(k, _)| k.clone());
+                match oldest {
+                    Some(k) => { m.remove(&k); }
+                    None => break,
+                }
+            }
             let entry = Entry {
                 resp: resp.clone(),
-                exp: Instant::now() + Duration::from_secs(self._ttl),
+                exp: Instant::now() + Duration::from_secs(self.ttl),
             };
             m.insert(key, entry);
         }

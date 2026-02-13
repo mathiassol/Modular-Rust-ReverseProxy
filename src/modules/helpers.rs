@@ -12,11 +12,15 @@ pub fn config_bool(c: &HashMap<String, toml::Value>, m: &str, k: &str, d: bool) 
 }
 
 pub fn config_u64(c: &HashMap<String, toml::Value>, m: &str, k: &str, d: u64) -> u64 {
-    c.get(m).and_then(|v| v.get(k)).and_then(|v| v.as_integer()).map(|v| v as u64).unwrap_or(d)
+    c.get(m).and_then(|v| v.get(k)).and_then(|v| v.as_integer())
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(d)
 }
 
 pub fn config_usize(c: &HashMap<String, toml::Value>, m: &str, k: &str, d: usize) -> usize {
-    c.get(m).and_then(|v| v.get(k)).and_then(|v| v.as_integer()).map(|v| v as usize).unwrap_or(d)
+    c.get(m).and_then(|v| v.get(k)).and_then(|v| v.as_integer())
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(d)
 }
 
 pub fn config_str(c: &HashMap<String, toml::Value>, m: &str, k: &str, d: &str) -> String {
@@ -47,16 +51,29 @@ pub fn json_response(c: u16, j: &str) -> HttpResponse {
 }
 
 pub fn bidirectional_stream(a: std::net::TcpStream, b: std::net::TcpStream, buf_size: usize) {
+    use std::time::Duration;
+    const STREAM_TIMEOUT: Duration = Duration::from_secs(120);
+
     let a_read = a;
     let a_write = match a_read.try_clone() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            crate::log::debug(&format!("bidirectional_stream: clone failed: {e}"));
+            return;
+        }
     };
     let b_read = b;
     let b_write = match b_read.try_clone() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            crate::log::debug(&format!("bidirectional_stream: clone failed: {e}"));
+            return;
+        }
     };
+
+    let _ = a_read.set_read_timeout(Some(STREAM_TIMEOUT));
+    let _ = b_read.set_read_timeout(Some(STREAM_TIMEOUT));
+
     let bs = buf_size;
     let t1 = std::thread::spawn(move || {
         stream_copy(a_read, b_write, bs);
@@ -64,8 +81,12 @@ pub fn bidirectional_stream(a: std::net::TcpStream, b: std::net::TcpStream, buf_
     let t2 = std::thread::spawn(move || {
         stream_copy(b_read, a_write, bs);
     });
-    let _ = t1.join();
-    let _ = t2.join();
+    if let Err(e) = t1.join() {
+        crate::log::warn(&format!("bidirectional_stream: thread panicked: {:?}", e));
+    }
+    if let Err(e) = t2.join() {
+        crate::log::warn(&format!("bidirectional_stream: thread panicked: {:?}", e));
+    }
 }
 
 fn stream_copy(mut r: std::net::TcpStream, mut w: std::net::TcpStream, buf_size: usize) {
@@ -75,9 +96,15 @@ fn stream_copy(mut r: std::net::TcpStream, mut w: std::net::TcpStream, buf_size:
         match r.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if w.write_all(&buf[..n]).is_err() { break; }
+                if let Err(e) = w.write_all(&buf[..n]) {
+                    crate::log::debug(&format!("stream_copy write error: {e}"));
+                    break;
+                }
             }
-            Err(_) => break,
+            Err(e) => {
+                crate::log::debug(&format!("stream_copy read error: {e}"));
+                break;
+            }
         }
     }
     let _ = w.shutdown(std::net::Shutdown::Write);

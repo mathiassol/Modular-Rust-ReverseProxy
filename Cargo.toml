@@ -7,5 +7,13 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 flate2 = "1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tokio-rustls = "0.26"
+h2 = "0.4"
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+bytes = "1"
+http = "1"

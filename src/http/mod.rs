@@ -38,7 +38,7 @@ pub enum ReadResult {
     Error(String),
 }
 
-fn find_zero_chunk(d: &[u8]) -> bool {
+pub fn find_zero_chunk(d: &[u8]) -> bool {
     if d.len() < 5 { return false; }
     let mut i = 0;
     while i < d.len() {
@@ -60,10 +60,13 @@ fn find_zero_chunk(d: &[u8]) -> bool {
         };
         if chunk_size == 0 {
             let after = size_end + 2;
-            return after <= d.len() && d[after..].starts_with(b"\r\n")
+            return (after <= d.len() && d[after..].starts_with(b"\r\n"))
                 || after == d.len();
         }
-        i = size_end + 2 + chunk_size;
+        i = match (size_end + 2).checked_add(chunk_size) {
+            Some(v) => v,
+            None => return false,
+        };
         if i + 1 >= d.len() { return false; }
         if d[i] != b'\r' || d[i + 1] != b'\n' { return false; }
         i += 2;
@@ -77,8 +80,14 @@ pub fn read_http_message(r: &mut impl Read, buf_size: usize) -> ReadResult {
     let (mut hdr_done, mut body_start, mut content_len) = (false, 0usize, None::<usize>);
     let mut is_chunked = false;
     let mut timed_out = false;
+    let mut read_calls: u32 = 0;
+    const MAX_READ_CALLS: u32 = 500;
 
     loop {
+        read_calls += 1;
+        if read_calls > MAX_READ_CALLS {
+            return ReadResult::Error("too many read syscalls".into());
+        }
         match r.read(&mut b) {
             Ok(0) => break,
             Ok(n) => {

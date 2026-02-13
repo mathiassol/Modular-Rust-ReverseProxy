@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-const BUCKET_CLEANUP_THRESHOLD: usize = 10_000;
+const MAX_BUCKETS: usize = 50_000;
 const BUCKET_STALE_SECS: f64 = 300.0;
 
 pub fn default_config() -> toml::Table {
@@ -46,14 +46,24 @@ impl Module for RateLimit {
         let mut bs = match self.buckets.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
-                crate::log::warn("rate_limiter: mutex recovered after panic");
-                poisoned.into_inner()
+                crate::log::warn("rate_limiter: mutex recovered after panic, clearing buckets");
+                let mut inner = poisoned.into_inner();
+                inner.clear();
+                inner
             }
         };
 
-        if bs.len() > BUCKET_CLEANUP_THRESHOLD {
+        if bs.len() >= MAX_BUCKETS {
             let now = Instant::now();
             bs.retain(|_, b| now.duration_since(b.last).as_secs_f64() < BUCKET_STALE_SECS);
+            if bs.len() >= MAX_BUCKETS {
+                let mut entries: Vec<(String, Instant)> = bs.iter().map(|(k, b)| (k.clone(), b.last)).collect();
+                entries.sort_by_key(|(_, t)| *t);
+                let to_evict = entries.len() / 4;
+                for (k, _) in entries.into_iter().take(to_evict.max(1)) {
+                    bs.remove(&k);
+                }
+            }
         }
 
         let b = bs.entry(ip).or_insert(Bucket { tokens: self.burst as f64, last: Instant::now() });

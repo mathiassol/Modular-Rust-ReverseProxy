@@ -28,6 +28,9 @@ pub struct Srv {
     pub logging: bool,
     pub tls_cert: String,
     pub tls_key: String,
+    pub http2: bool,
+    pub http3: bool,
+    pub h3_port: u16,
 }
 
 impl Default for Config {
@@ -53,12 +56,14 @@ impl Default for Srv {
             logging: true,
             tls_cert: String::new(),
             tls_key: String::new(),
+            http2: true,
+            http3: false,
+            h3_port: 0,
         }
     }
 }
 
 impl Srv {
-    /// Validate configuration and warn/fix invalid values. Returns false if config is fatally invalid.
     pub fn validate(&mut self) -> bool {
         let mut valid = true;
 
@@ -109,23 +114,30 @@ impl Srv {
             if self.tls_cert.is_empty() {
                 crate::log::error("tls_key is set but tls_cert is missing");
                 valid = false;
-            }
-            if self.tls_key.is_empty() {
+            } else if self.tls_key.is_empty() {
                 crate::log::error("tls_cert is set but tls_key is missing");
                 valid = false;
-            }
-            if !self.tls_cert.is_empty() && !std::path::Path::new(&self.tls_cert).exists() {
-                crate::log::error(&format!("tls_cert file not found: {}", self.tls_cert));
-                valid = false;
-            }
-            if !self.tls_key.is_empty() && !std::path::Path::new(&self.tls_key).exists() {
-                crate::log::error(&format!("tls_key file not found: {}", self.tls_key));
-                valid = false;
+            } else {
+                if !std::path::Path::new(&self.tls_cert).exists() {
+                    crate::log::error(&format!("tls_cert file not found: {}", self.tls_cert));
+                    valid = false;
+                }
+                if !std::path::Path::new(&self.tls_key).exists() {
+                    crate::log::error(&format!("tls_key file not found: {}", self.tls_key));
+                    valid = false;
+                }
             }
         }
 
         valid
     }
+}
+
+fn atomic_write(path: &str, content: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn load_config(module_defaults: &HashMap<String, toml::Value>) -> Config {
@@ -146,7 +158,7 @@ pub fn load_config(module_defaults: &HashMap<String, toml::Value>) -> Config {
             let mut cfg = Config::default();
             cfg.modules = module_defaults.clone();
             let content = generate_config(&cfg);
-            if fs::write(&p, &content).is_ok() {
+            if atomic_write(&p, &content).is_ok() {
                 crate::log::info(&format!("Generated {p}"));
             } else {
                 crate::log::warn(&format!("No config at '{p}', using defaults"));
@@ -155,12 +167,25 @@ pub fn load_config(module_defaults: &HashMap<String, toml::Value>) -> Config {
         }
     };
     if !cfg.server.validate() {
-        crate::log::error("Fatal configuration errors, using defaults for invalid addresses");
+        crate::log::error("Fatal configuration errors — falling back to safe defaults for invalid fields");
         if cfg.server.listen_addr.parse::<std::net::SocketAddr>().is_err() {
-            cfg.server.listen_addr = "127.0.0.1:3000".to_string();
+            let fallback = "127.0.0.1:3000";
+            crate::log::warn(&format!("listen_addr invalid, using {fallback}"));
+            cfg.server.listen_addr = fallback.to_string();
         }
         if cfg.server.backend_addr.parse::<std::net::SocketAddr>().is_err() {
-            cfg.server.backend_addr = "127.0.0.1:8080".to_string();
+            let fallback = "127.0.0.1:8080";
+            crate::log::warn(&format!("backend_addr invalid, using {fallback}"));
+            cfg.server.backend_addr = fallback.to_string();
+        }
+        if !cfg.server.tls_cert.is_empty() || !cfg.server.tls_key.is_empty() {
+            let cert_ok = !cfg.server.tls_cert.is_empty() && std::path::Path::new(&cfg.server.tls_cert).exists();
+            let key_ok = !cfg.server.tls_key.is_empty() && std::path::Path::new(&cfg.server.tls_key).exists();
+            if !cert_ok || !key_ok {
+                crate::log::warn("TLS config invalid, disabling TLS");
+                cfg.server.tls_cert.clear();
+                cfg.server.tls_key.clear();
+            }
         }
     }
     let mut changed = false;
@@ -172,8 +197,11 @@ pub fn load_config(module_defaults: &HashMap<String, toml::Value>) -> Config {
     }
     if changed {
         let content = generate_config(&cfg);
-        let _ = fs::write(&p, &content);
-        crate::log::info("Config updated with new module defaults");
+        if let Err(e) = atomic_write(&p, &content) {
+            crate::log::error(&format!("Failed to write config: {e}"));
+        } else {
+            crate::log::info("Config updated with new module defaults");
+        }
     }
     cfg
 }
@@ -195,6 +223,9 @@ fn generate_config(cfg: &Config) -> String {
     srv.insert("logging".into(), toml::Value::Boolean(cfg.server.logging));
     srv.insert("tls_cert".into(), toml::Value::String(cfg.server.tls_cert.clone()));
     srv.insert("tls_key".into(), toml::Value::String(cfg.server.tls_key.clone()));
+    srv.insert("http2".into(), toml::Value::Boolean(cfg.server.http2));
+    srv.insert("http3".into(), toml::Value::Boolean(cfg.server.http3));
+    srv.insert("h3_port".into(), toml::Value::Integer(cfg.server.h3_port as i64));
     doc.insert("server".into(), toml::Value::Table(srv));
     let mut mods = toml::Table::new();
     for (name, value) in &cfg.modules {
@@ -212,12 +243,8 @@ fn generate_config(cfg: &Config) -> String {
 
 fn path() -> String {
     let args: Vec<String> = std::env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--config" {
-            if let Some(p) = args.get(i + 1) {
-                return p.clone();
-            }
-        }
-    }
-    "config.toml".to_string()
+    args.windows(2)
+        .find(|w| w[0] == "--config")
+        .map(|w| w[1].clone())
+        .unwrap_or_else(|| "config.toml".to_string())
 }

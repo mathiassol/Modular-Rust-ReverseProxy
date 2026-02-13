@@ -1,19 +1,18 @@
-[modules]
 [modules.active_health]
-enabled = true
+enabled = false
 interval = 10
 timeout = 3
 
 [modules.admin_api]
+api_key = ""
 enabled = true
-listen_addr = '127.0.0.1:9090'
+listen_addr = "127.0.0.1:9090"
 
 [modules.cache]
-backend_addr = '127.0.0.1:8080'
-enabled = true
-max_entries = 1000
-ttl_seconds = 15
-warm_urls = ''
+enabled = false
+max_size = 100
+ttl_seconds = 300
+warm_urls = []
 
 [modules.circuit_breaker]
 enabled = false
@@ -25,49 +24,49 @@ enabled = false
 min_size = 256
 
 [modules.health_check]
-enabled = false
-path = '/health'
+enabled = true
+endpoint = "/health"
 
 [modules.load_balancer]
-backends = ['127.0.0.1:8080', '127.0.0.1:8081']
+backends = []
 enabled = false
-
-[modules.logging]
-enabled = true
 
 [modules.metrics_exporter]
 enabled = false
-endpoint = '/metrics'
+endpoint = "/metrics"
 
 [modules.proxy_core]
 enabled = true
 
 [modules.rate_limiter]
+burst = 20
 enabled = false
-max_requests = 20
-window_seconds = 60
+requests_per_second = 10
 
 [modules.raw_tcp]
 enabled = false
 
 [modules.request_id]
-enabled = true
+enabled = false
 
 [modules.url_rewriter]
 enabled = false
 
-[[modules.url_rewriter.rules]]
-from = '/api/v1'
-to = '/v1'
-
 [server]
-backend_addr = '127.0.0.1:8080'
+backend_addr = "127.0.0.1:8080"
 backend_timeout = 30
 buffer_size = 8192
 client_timeout = 30
-listen_addr = '0.0.0.0:3000'
+h3_port = 0
+http2 = true
+http3 = false
+listen_addr = "0.0.0.0:3000"
+log_level = "info"
 logging = true
 max_body_size = 16777216
 max_connections = 10000
 max_header_size = 65536
+shutdown_timeout = 15
+tls_cert = "cert.pem"
+tls_key = "key.pem"
 worker_threads = 0

@@ -1,11 +1,10 @@
-// Auto-generated module registry — 14 modules discovered
+// Auto-generated module registry
 mod active_health;
 mod admin_api;
 mod cache;
 mod circuit_breaker;
 mod compression;
 mod health_check;
-mod helpers;
 mod load_balancer;
 mod metrics_exporter;
 mod proxy_core;
@@ -13,6 +12,8 @@ mod rate_limiter;
 mod raw_tcp;
 mod request_id;
 mod url_rewriter;
+
+pub mod helpers;
 
 use crate::config::Srv;
 use crate::context::Context;
@@ -30,8 +31,27 @@ pub trait RawHandler: Send + Sync {
     fn handle_raw(&self, client: std::net::TcpStream);
 }
 
+fn default_priority(name: &str) -> i32 {
+    match name {
+        "active_health" => 10,
+        "request_id" => 20,
+        "rate_limiter" => 30,
+        "circuit_breaker" => 40,
+        "health_check" => 50,
+        "metrics_exporter" => 60,
+        "admin_api" => 70,
+        "cache" => 80,
+        "url_rewriter" => 90,
+        "compression" => 100,
+        "load_balancer" => 110,
+        "proxy_core" => 120,
+        "raw_tcp" => 130,
+        _ => 75,
+    }
+}
+
 pub struct Pipeline {
-    mods: Vec<Box<dyn Module>>,
+    mods: Vec<(i32, Box<dyn Module>)>,
     raw: Option<Box<dyn RawHandler>>,
     overridden: HashSet<String>,
     to: u64,
@@ -42,6 +62,10 @@ impl Pipeline {
         Pipeline { mods: Vec::new(), raw: None, overridden: HashSet::new(), to: t }
     }
     pub fn add(&mut self, m: Box<dyn Module>) {
+        let p = default_priority(m.name());
+        self.add_with_priority(m, p);
+    }
+    pub fn add_with_priority(&mut self, m: Box<dyn Module>, priority: i32) {
         let name = m.name().to_string();
         if self.overridden.contains(&name) {
             crate::log::module_skipped(&name);
@@ -51,11 +75,11 @@ impl Pipeline {
             self.override_module(o);
         }
         crate::log::module_loaded(&name);
-        self.mods.push(m);
+        self.mods.push((priority, m));
     }
     pub fn override_module(&mut self, name: &str) {
         self.overridden.insert(name.to_string());
-        self.mods.retain(|m| m.name() != name);
+        self.mods.retain(|(_, m)| m.name() != name);
     }
     pub fn set_raw_handler(&mut self, h: Box<dyn RawHandler>) {
         crate::log::module_loaded("raw connection handler");
@@ -64,10 +88,23 @@ impl Pipeline {
     pub fn raw_handler(&self) -> Option<&dyn RawHandler> {
         self.raw.as_deref()
     }
+    /// Sort modules by priority (call after all registration is done)
+    pub fn sort(&mut self) {
+        self.mods.sort_by_key(|(p, _)| *p);
+    }
+    /// Check if a module with the given name is already loaded
+    pub fn has_module(&self, name: &str) -> bool {
+        self.mods.iter().any(|(_, m)| m.name() == name)
+    }
+    /// Get names of all loaded modules
+    #[allow(dead_code)]
+    pub fn module_names(&self) -> Vec<String> {
+        self.mods.iter().map(|(_, m)| m.name().to_string()).collect()
+    }
     pub fn handle(&self, r: &mut HttpRequest, c: &mut Context) -> HttpResponse {
         let mut resp_idx = None;
         let mut resp = HttpResponse::error(500, "No handler");
-        for (i, m) in self.mods.iter().enumerate() {
+        for (i, (_, m)) in self.mods.iter().enumerate() {
             if let Some(r) = m.handle(r, c) {
                 resp = r;
                 resp_idx = Some(i);
@@ -75,7 +112,7 @@ impl Pipeline {
             }
         }
         let limit = resp_idx.map(|i| i + 1).unwrap_or(self.mods.len());
-        for m in self.mods[..limit].iter().rev() {
+        for (_, m) in self.mods[..limit].iter().rev() {
             m.on_response(r, &mut resp, c);
         }
         resp
